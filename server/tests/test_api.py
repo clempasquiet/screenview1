@@ -127,6 +127,179 @@ def test_unknown_device_ping_returns_404(client: TestClient) -> None:
     assert resp.status_code == 404
 
 
+# ---------------------------------------------------------------------------
+# PATCH /api/schedules/{id} — regression tests
+# ---------------------------------------------------------------------------
+#
+# Every test below PATCHes a schedule that *already* has items, which is the
+# exact code path that used to raise
+#
+#   sqlalchemy.exc.InvalidRequestError: Instance '<ScheduleItem …>' has
+#   been deleted. Use the make_transient() function …
+#
+# in the field (the bug was invisible to every earlier test because they
+# only ever PATCHed freshly-created *empty* schedules).
+
+
+def _upload_image(client: TestClient, name: str, payload: bytes = b"x") -> int:
+    headers = _admin_auth(client)
+    resp = client.post(
+        "/api/media",
+        headers=headers,
+        files={"file": (name, payload, "image/png")},
+        data={"default_duration": "4"},
+    )
+    assert resp.status_code == 201, resp.text
+    return resp.json()["id"]
+
+
+def test_patch_schedule_replaces_existing_items(client: TestClient) -> None:
+    headers = _admin_auth(client)
+    m1 = _upload_image(client, "a.png", b"aaa")
+    m2 = _upload_image(client, "b.png", b"bbb")
+    m3 = _upload_image(client, "c.png", b"ccc")
+
+    created = client.post(
+        "/api/schedules",
+        headers=headers,
+        json={
+            "name": "Rotation",
+            "items": [
+                {"media_id": m1, "order": 0, "duration_override": 5},
+                {"media_id": m2, "order": 1, "duration_override": 5},
+            ],
+        },
+    )
+    assert created.status_code == 201, created.text
+    schedule_id = created.json()["id"]
+
+    # Replace the whole playlist. This used to 500 with the cascade
+    # error described above.
+    resp = client.patch(
+        f"/api/schedules/{schedule_id}",
+        headers=headers,
+        json={
+            "items": [
+                {"media_id": m3, "order": 0, "duration_override": 7},
+                {"media_id": m1, "order": 1, "duration_override": 8},
+            ],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert len(body["items"]) == 2
+    media_ids = [it["media_id"] for it in body["items"]]
+    assert media_ids == [m3, m1]
+    assert body["items"][0]["duration_override"] == 7
+    assert body["items"][1]["duration_override"] == 8
+
+
+def test_patch_schedule_clears_all_items(client: TestClient) -> None:
+    headers = _admin_auth(client)
+    m1 = _upload_image(client, "d.png", b"ddd")
+
+    created = client.post(
+        "/api/schedules",
+        headers=headers,
+        json={"name": "Temp", "items": [{"media_id": m1, "order": 0}]},
+    )
+    schedule_id = created.json()["id"]
+
+    resp = client.patch(
+        f"/api/schedules/{schedule_id}",
+        headers=headers,
+        json={"items": []},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["items"] == []
+
+
+def test_patch_schedule_is_idempotent_with_same_items(client: TestClient) -> None:
+    """PATCHing with the same items twice must not accumulate rows or
+    trip the cascade error on the second call."""
+    headers = _admin_auth(client)
+    m1 = _upload_image(client, "e.png", b"eee")
+    m2 = _upload_image(client, "f.png", b"fff")
+
+    created = client.post(
+        "/api/schedules",
+        headers=headers,
+        json={"name": "Loop", "items": [{"media_id": m1, "order": 0}]},
+    )
+    schedule_id = created.json()["id"]
+
+    payload = {
+        "items": [
+            {"media_id": m1, "order": 0, "duration_override": 3},
+            {"media_id": m2, "order": 1, "duration_override": 3},
+        ],
+    }
+
+    for _ in range(3):
+        resp = client.patch(f"/api/schedules/{schedule_id}", headers=headers, json=payload)
+        assert resp.status_code == 200, resp.text
+        assert len(resp.json()["items"]) == 2
+
+
+def test_patch_schedule_rejects_invalid_media_without_mutating(client: TestClient) -> None:
+    """Validation happens up-front: the old items must still be there if
+    the PATCH is rejected."""
+    headers = _admin_auth(client)
+    m1 = _upload_image(client, "g.png", b"ggg")
+
+    created = client.post(
+        "/api/schedules",
+        headers=headers,
+        json={
+            "name": "Keeper",
+            "items": [{"media_id": m1, "order": 0, "duration_override": 6}],
+        },
+    )
+    schedule_id = created.json()["id"]
+
+    resp = client.patch(
+        f"/api/schedules/{schedule_id}",
+        headers=headers,
+        json={
+            "items": [
+                {"media_id": m1, "order": 0},
+                {"media_id": 999_999, "order": 1},  # doesn't exist
+            ],
+        },
+    )
+    assert resp.status_code == 400
+
+    # The original item is still there; the request didn't leak a partial mutation.
+    fresh = client.get(f"/api/schedules/{schedule_id}", headers=headers).json()
+    assert len(fresh["items"]) == 1
+    assert fresh["items"][0]["media_id"] == m1
+    assert fresh["items"][0]["duration_override"] == 6
+
+
+def test_patch_schedule_name_only_leaves_items(client: TestClient) -> None:
+    """A PATCH that doesn't touch items at all must leave them intact
+    (items=None in the payload means 'no change')."""
+    headers = _admin_auth(client)
+    m1 = _upload_image(client, "h.png", b"hhh")
+
+    created = client.post(
+        "/api/schedules",
+        headers=headers,
+        json={"name": "Old", "items": [{"media_id": m1, "order": 0}]},
+    )
+    schedule_id = created.json()["id"]
+
+    resp = client.patch(
+        f"/api/schedules/{schedule_id}",
+        headers=headers,
+        json={"name": "New name"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["name"] == "New name"
+    assert len(resp.json()["items"]) == 1
+    assert resp.json()["items"][0]["media_id"] == m1
+
+
 def test_manifest_requires_token_and_returns_signed_urls(client: TestClient) -> None:
     headers = _admin_auth(client)
 
