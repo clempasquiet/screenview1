@@ -169,17 +169,24 @@ See `player-windows/README.md` for the full kiosk lockdown checklist.
    every page as an ordinary image `Media` row. The player sees
    normal images; the rest of the pipeline (cache, MD5, signed URLs,
    preview) works unchanged.
-8. **Layered player UI (Phase 2).** The Windows player composes two
-   **permanently-visible** surfaces: libmpv's hardware video output
-   on the bottom layer, a transparent `QWebEngineView` on top. All
-   image / widget / text / placeholder content is rendered as HTML
-   into the overlay; the overlay's transparent zones let the video
-   show through. The overlay's z-order is set **once** at startup —
-   runtime mutation of the web view is what caused the Phase 1
-   "audio plays, picture is black" bug on Windows. See
-   `player-windows/layout_html.py` for the renderer and
-   `tests/test_render_video_isolation.py` for the guard-rail
-   assertions that pin the invariant.
+8. **Single-visible-surface player UI (Phase 2, Windows).** The
+   Windows player owns three full-window children — a native
+   `QWidget` for libmpv, a `QLabel` for images, a `QWebEngineView`
+   for HTML widgets + the branded placeholder — and keeps **exactly
+   one visible at any moment**. Originally Step 3 proposed a
+   permanently-layered design (mpv bottom, transparent WebEngine on
+   top) but Windows' DWM does not alpha-blend sibling HWNDs in the
+   same top-level window, so the overlay ended up clipping mpv and
+   we got audio-only playback. The revised architecture uses
+   dedicated ``_switch_to_video`` / ``_switch_to_image`` /
+   ``_switch_to_overlay`` helpers as the **only** places that toggle
+   child visibility; each `_render` branch calls exactly one. Mixing
+   content layers (e.g. an image zone over a playing video) is left
+   for a later PR that migrates mpv to
+   `QOpenGLWidget + mpv.render_api` so compositing happens inside a
+   single GL surface. See
+   `player-windows/tests/test_render_video_isolation.py` for the
+   static assertions that pin this contract.
 
 ## Security model
 
