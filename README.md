@@ -151,15 +151,39 @@ See `player-windows/README.md` for the full kiosk lockdown checklist.
 5. **Atomic playlist swaps.** A newly downloaded playlist only takes
    effect at the end of the currently playing media, so the viewer never
    sees partial or broken content.
+6. **Per-device credentials + HMAC-signed media URLs.** Each player is
+   issued an opaque `api_token` at registration. Every REST and
+   WebSocket call authenticates with it, and the manifest returns
+   pre-signed download URLs whose HMAC binds `device_id`, `media_id`
+   and an `exp` timestamp to the device's own token. A leaked URL is
+   unusable after expiry, from a different device, or after the
+   operator rotates the token from the CMS.
+
+## Security model
+
+| Transport        | Credential                              | Behaviour on failure                  |
+|------------------|-----------------------------------------|---------------------------------------|
+| Admin REST       | JWT from `/api/auth/login`              | 401                                   |
+| Player REST      | `Authorization: Bearer <api_token>`     | 401 → player clears config, re-registers |
+| Player WebSocket | `?token=<api_token>` query parameter    | Close code 4401 → same recovery flow  |
+| Media download   | Pre-signed `?device_id&exp&sig` URL     | 403 on bad sig, 403 on expiry         |
+| Unknown device   | any                                     | 404 REST / close 4404 WS              |
+
+Token rotation is available from the **Devices** view in the CMS.
+Rotating a token invalidates every outstanding manifest for that device;
+the player transparently recovers on its next call.
 
 ## Synchronisation workflow
 
 1. Admin edits a schedule in the CMS and clicks **Publish**.
 2. Server emits `{"action": "sync_required"}` on the per-device WebSocket.
 3. Player's worker receives the signal and GETs
-   `/api/schedule/{device_id}` — a JSON manifest with URLs + MD5 hashes.
+   `/api/schedule/{device_id}` with `Authorization: Bearer <api_token>` —
+   a JSON manifest containing, for every item, a pre-signed download URL
+   (`?device_id&exp&sig`) and the MD5 hash.
 4. Worker diffs the manifest against its local cache, downloads the
-   missing items, and verifies each MD5.
+   missing items (no extra auth header needed — the URL itself is a
+   credential), and verifies each MD5.
 5. On success, the worker emits `playlist_ready` to the UI thread.
 6. The UI thread queues the new list and switches at the end of the
    current media (gapless).
@@ -168,7 +192,8 @@ See `player-windows/README.md` for the full kiosk lockdown checklist.
 
 Defined in `server/models.py` (SQLModel):
 
-- **Device** — registered player, status, assigned schedule, last ping.
+- **Device** — registered player, status, assigned schedule, last ping,
+  per-device `api_token` (rotated at registration and from the CMS).
 - **Media** — uploaded file (video/image/widget) with MD5 + default duration.
 - **Schedule** — named playlist referenced by one or more devices.
 - **ScheduleItem** — ordered join row allowing per-item duration overrides.
@@ -187,11 +212,13 @@ python -m pytest player-windows/tests
 
 ## Roadmap
 
-- [ ] Signed media download URLs (per-device HMAC).
-- [ ] Per-device API tokens (no more UUID-as-shared-secret).
+- [x] Per-device API tokens (replaces UUID-as-shared-secret).
+- [x] Signed media download URLs (per-device HMAC with expiry).
 - [ ] Live preview of schedules in the CMS.
 - [ ] PostgreSQL migration path once SQLite becomes a bottleneck.
 - [ ] HLS / RTSP live streams as an opt-in media type.
+- [ ] Per-device HTTP/S TLS certificates (mTLS) for zero-trust fleets.
+- [ ] Scheduled content (day-parting) instead of a single active playlist per device.
 
 ## License
 
