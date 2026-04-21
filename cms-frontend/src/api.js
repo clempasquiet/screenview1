@@ -63,6 +63,16 @@ export const api = {
     fd.append('default_duration', String(default_duration))
     return request('/api/media', { method: 'POST', body: fd })
   },
+  // PDF uploads are routed server-side to a flattener that produces
+  // one image per page. The result carries an {pages_added,
+  // pages_deduplicated, pages} shape — see PdfIngestResult in schemas.
+  uploadPdf(file, { default_duration = 10, dpi = 150 } = {}) {
+    const fd = new FormData()
+    fd.append('file', file)
+    fd.append('default_duration', String(default_duration))
+    fd.append('dpi', String(dpi))
+    return request('/api/media/pdf', { method: 'POST', body: fd })
+  },
   createStreamMedia({ name, url, default_duration = 30, mime_type = null }) {
     return request('/api/media/stream', {
       method: 'POST',

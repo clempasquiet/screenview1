@@ -163,6 +163,12 @@ See `player-windows/README.md` for the full kiosk lockdown checklist.
    and an `exp` timestamp to the device's own token. A leaked URL is
    unusable after expiry, from a different device, or after the
    operator rotates the token from the CMS.
+7. **Server-side PDF flattening.** Players never parse PDF. Uploading
+   a `.pdf` hits a dedicated endpoint that renders each page to a
+   JPEG server-side (via PyMuPDF at 150 DPI by default) and persists
+   every page as an ordinary image `Media` row. The player sees
+   normal images; the rest of the pipeline (cache, MD5, signed URLs,
+   preview) works unchanged.
 
 ## Security model
 
@@ -210,6 +216,9 @@ Defined in `server/models.py` (SQLModel):
   (`video`/`image`/`widget`, with `filename` + `md5_hash`) or a live
   `stream` item (with `stream_url` instead of file/MD5). The `Media` row
   carries both shapes; the `type` discriminates.
+  PDF uploads go through `POST /api/media/pdf`, which flattens every
+  page into an `image` row server-side via PyMuPDF — players never
+  deal with the PDF format.
 - **Schedule** — named playlist referenced by one or more devices.
 - **ScheduleItem** — ordered playlist slot. Exactly one of
   `media_id` (legacy single-media slot) or `layout_id` (Phase 2
