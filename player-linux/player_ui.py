@@ -162,6 +162,12 @@ class PlayerWindow(QWidget):
             QTimer.singleShot(1000, self._advance)
             return
 
+        # Auto-advance policy:
+        #   * Recorded videos: advance on libmpv eof-reached, ignore duration.
+        #   * Live streams: no natural EOF, so we *also* arm the duration
+        #     timer. Whichever fires first (timer or premature EOF on
+        #     network error) wins.
+        #   * Images / widgets: timer-driven.
         if entry.kind != "video" or self._mpv is None:
             self._advance_timer.start(max(1, entry.duration) * 1000)
 
@@ -185,6 +191,19 @@ class PlayerWindow(QWidget):
                 raise RuntimeError("libmpv not available")
             self._stack.setCurrentWidget(self._video_container)
             self._mpv.loadfile(str(path), mode="replace")
+            self._mpv.pause = False
+            return
+
+        if entry.kind == "stream":
+            if self._mpv is None:
+                raise RuntimeError("libmpv not available — cannot play live streams")
+            if not entry.stream_url:
+                raise ValueError("Stream item missing upstream URL")
+            self._stack.setCurrentWidget(self._video_container)
+            # Hand the URL straight to libmpv; if the stream is
+            # unreachable mpv reports EOF almost immediately and the
+            # duration timer below skips past the broken item.
+            self._mpv.loadfile(entry.stream_url, mode="replace")
             self._mpv.pause = False
             return
 
