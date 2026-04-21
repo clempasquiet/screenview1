@@ -1,58 +1,77 @@
 """Kiosk-mode UI for the ScreenView Windows player.
 
-Phase 2 architecture: **layered** rendering instead of a stack switcher.
+Phase 2 Step 3 originally proposed a truly layered design (libmpv on
+the bottom, a *transparent* ``QWebEngineView`` permanently on top). On
+Linux/macOS that works because compositing is done by the window
+manager with per-pixel alpha between sibling HWNDs. On Windows it
+does NOT work: DWM does not alpha-blend a Chromium HWND over a sibling
+HWND in the same top-level window, so the web view ends up opaquely
+clipping mpv behind it — producing audio-only playback. We hit the
+symptom on a real kiosk.
 
-Two child surfaces are instantiated once and remain visible together
-for the entire process lifetime:
+Revised architecture (this file)
+================================
+Three surfaces, **exactly one visible at any given moment**, and a
+strict discipline on who owns which transitions:
 
-  * **Layer 0** — a native ``QWidget`` that hosts libmpv's hardware
-    video output. Plays at most one video or live stream at a time.
-  * **Layer 1** — a ``QWebEngineView`` with a **transparent** page +
-    ``WA_TranslucentBackground`` on the widget. Renders the current
-    frame's HTML composition (images, HTML widgets, text, placeholder).
-    Transparent areas of the HTML let the video on Layer 0 show
-    through.
+    ┌────────────────────────────────────────────┐
+    │  self (QWidget, frameless, always-on-top)  │
+    │                                            │
+    │   _video_container   (QWidget)   —  mpv    │  Layer A
+    │   _image_label       (QLabel)    —  images │  Layer B
+    │   _web_view          (QWebEngineView)      │  Layer C
+    │                                            │
+    └────────────────────────────────────────────┘
 
-The previous design used a ``QStackedWidget`` that flipped between
-children. On Windows that caused the "audio plays but picture is
-black" bug that spooked PR #10: mutating a *hidden* ``QWebEngineView``
-woke up Chromium's compositor which then raised its native HWND above
-libmpv's in the OS z-order. With the layered design the web view is
-**always** on top by construction, so redrawing it is a no-op for z-
-order.
+All three children share the same geometry (full window). At any
+point exactly one is visible; the other two are hidden. Transitions
+go through three private helpers:
+
+  * ``_switch_to_video()``    — hide web view + label; mpv shows.
+  * ``_switch_to_image()``    — show label (opaque), hide web view;
+                                 mpv keeps running behind but is
+                                 occluded by the label.
+  * ``_switch_to_overlay()``  — show web view (opaque or transparent
+                                 depending on page), hide label.
+
+The web view's stacking is set **once** at startup via ``raise_()``
+so the previous black-video regression (reshuffling z-order at
+runtime) cannot return. The child visibility toggles are the only
+runtime z-order mutation we tolerate — and they never touch the
+contents of a hidden view.
+
+Layered rendering for true overlay-on-video (text over a playing
+clip) is left for a future PR that migrates mpv to
+``QOpenGLWidget + mpv.render_api`` so compositing happens within a
+single GL surface. That is a larger change that needs a real Windows
+kiosk in the loop, so it's out of scope here.
 
 Runtime contract
 ================
-The external interface is unchanged:
+External interface is unchanged:
 
   * ``PlayerWindow(fullscreen=..., show_cursor=..., …)``
   * ``.set_playlist(entries: list[PlaylistEntry])`` — queue the next
     playlist; swaps in at end-of-media for gapless transitions.
   * ``.show_status(level, message)`` — log sink the worker signals to.
 
-``PlaylistEntry.kind`` still takes values ``image`` / ``video`` /
+``PlaylistEntry.kind`` takes values ``image`` / ``video`` /
 ``stream`` / ``widget``; this PR does not change the manifest format.
-Layout-aware entries (Phase 2 Step 4) will arrive as a new kind
-(e.g. ``layout``) without churn to the routing below.
 
-Failure handling
-================
-  * Render errors never cascade into an infinite retry loop. Each
-    entry tracks a failure count; after ``MAX_ITEM_FAILURES`` failures
-    the entry is skipped for the rest of that playlist. If every entry
-    fails we fall back to the placeholder until a new manifest
-    arrives.
+Failure handling (from Phase 1, preserved)
+==========================================
+  * Each entry tracks a failure count; after ``MAX_ITEM_FAILURES``
+    failures the entry is skipped for the rest of that playlist.
+  * If every entry fails we fall back to the placeholder until a new
+    manifest arrives.
 
 Memory hygiene (from Phase 1 Fix 3, preserved here)
 ===================================================
-  * The WebEngine profile is configured at startup with
-    ``MemoryHttpCache`` + ``NoPersistentCookies`` + a 50 MiB ceiling
-    so a 24/7 kiosk loading many widget pages cannot grow the cache
-    on disk.
-  * Before each widget load we wipe the profile's in-memory cache +
-    cookies.
-  * ``closeEvent`` performs a final teardown (about:blank, deleteLater,
-    gc.collect) to free Chromium's persistent state at process exit.
+  * WebEngine profile configured at startup with ``MemoryHttpCache``
+    + ``NoPersistentCookies`` + a 50 MiB ceiling.
+  * We wipe the profile's in-memory cache + cookies before every
+    widget / placeholder load.
+  * ``closeEvent`` performs a final teardown.
 """
 from __future__ import annotations
 
@@ -64,28 +83,26 @@ from pathlib import Path
 from typing import Optional
 
 from PyQt6.QtCore import QSize, Qt, QTimer, QUrl
-from PyQt6.QtGui import QColor, QGuiApplication, QKeySequence, QShortcut
+from PyQt6.QtGui import QGuiApplication, QKeySequence, QPixmap, QShortcut
 from PyQt6.QtWidgets import (
     QApplication,
-    QVBoxLayout,
+    QLabel,
     QWidget,
 )
 
 try:
     from PyQt6.QtWebEngineWidgets import QWebEngineView  # type: ignore[import-not-found]
-    from PyQt6.QtWebEngineCore import QWebEngineProfile, QWebEnginePage  # type: ignore[import-not-found]
+    from PyQt6.QtWebEngineCore import QWebEngineProfile  # type: ignore[import-not-found]
 
     HAS_WEBENGINE = True
 except Exception:  # noqa: BLE001
     HAS_WEBENGINE = False
     QWebEngineProfile = None  # type: ignore[assignment]
-    QWebEnginePage = None  # type: ignore[assignment]
 
 from layout_html import (
     ensure_absolute_url,
     render_layout_html,
     render_placeholder_layout,
-    render_single_image_layout,
 )
 from libmpv_fetch import ensure_libmpv
 from worker_network import PlaylistEntry
@@ -188,14 +205,15 @@ def _try_load_mpv(
 class PlayerWindow(QWidget):
     """Fullscreen, borderless, always-on-top kiosk window.
 
-    Children (always both alive, both visible):
+    Children (all full-window, exactly one visible at any moment):
 
-      * ``_video_container``  — Layer 0, hosts libmpv.
-      * ``_web_view``         — Layer 1, transparent HTML overlay.
+      * ``_video_container`` — native QWidget hosting libmpv.
+      * ``_image_label``     — QLabel that renders the current image.
+      * ``_web_view``        — QWebEngineView for widgets + placeholder.
 
-    The web view is raised above the video container at construction
-    time and we **never** reshuffle the z-order afterwards. That is
-    how we avoid the Phase-1 "black video" regression.
+    The ``_switch_to_*`` helpers are the only code paths allowed to
+    mutate child visibility. ``_render`` calls exactly one of them per
+    entry, immediately before handing content to the surface.
     """
 
     def __init__(
@@ -216,54 +234,56 @@ class PlayerWindow(QWidget):
         if not show_cursor:
             self.setCursor(Qt.CursorShape.BlankCursor)
 
-        # No QVBoxLayout / QStackedWidget: we position the two children
-        # manually in ``resizeEvent`` so they both occupy the whole
-        # window and the overlay stays on top regardless of what the
-        # layout manager would otherwise do on stack changes.
+        # --- Layer A: native container for libmpv ---
+        # WA_NativeWindow guarantees Qt creates the HWND up-front so
+        # libmpv can attach via winId(). WA_DontCreateNativeAncestors
+        # keeps the parent chain logical (non-native) — that's how the
+        # video container stays cleanly addressable by mpv without
+        # forcing the whole tree into native windows.
         self._video_container = QWidget(self)
         self._video_container.setStyleSheet("background-color: #000;")
         self._video_container.setAttribute(Qt.WidgetAttribute.WA_DontCreateNativeAncestors)
         self._video_container.setAttribute(Qt.WidgetAttribute.WA_NativeWindow)
 
+        # --- Layer B: QLabel for images ---
+        # Kept separate from the WebEngine on purpose. Putting images
+        # through Chromium is fine visually but has a side-effect we
+        # care about on Windows: a *visible* QWebEngineView sibling
+        # will clip a libmpv HWND even with WA_TranslucentBackground
+        # set, because DWM doesn't alpha-blend sibling HWNDs. So we
+        # use the label for images (cheap, opaque by design) and only
+        # wake the WebEngine for widgets + placeholder.
+        self._image_label = QLabel(self)
+        self._image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._image_label.setStyleSheet("background-color: #000;")
+        self._image_label.hide()
+
+        # --- Layer C: QWebEngineView for widgets + placeholder ---
         self._web_view: QWebEngineView | None = None
         if HAS_WEBENGINE:
             self._web_view = QWebEngineView(self)
-            # Make the web surface itself transparent at every layer
-            # the compositor cares about: the widget attribute, the
-            # page background colour (Chromium), and the underlying
-            # palette (Qt).
-            self._web_view.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-            self._web_view.setStyleSheet("background: transparent;")
-            page = self._web_view.page()
+            # Still set background attributes for cleanliness; they
+            # don't help with the DWM issue but keep the rendered
+            # page consistent when it IS on screen.
+            self._web_view.setStyleSheet("background-color: #000;")
             try:
-                page.setBackgroundColor(QColor(0, 0, 0, 0))
-            except Exception as exc:  # noqa: BLE001
-                # Non-fatal: the HTML's own background still renders.
-                logger.debug("setBackgroundColor failed: %s", exc)
-
-            # Cap the WebEngine disk cache so a 24/7 kiosk loading many
-            # widget pages cannot grow it unbounded. Mirrors the Phase
-            # 1 Fix 3 tuning.
-            try:
-                profile = page.profile()
+                profile = self._web_view.page().profile()
                 profile.setHttpCacheType(QWebEngineProfile.HttpCacheType.MemoryHttpCache)
                 profile.setPersistentCookiesPolicy(
                     QWebEngineProfile.PersistentCookiesPolicy.NoPersistentCookies
                 )
-                profile.setHttpCacheMaximumSize(50 * 1024 * 1024)  # 50 MiB
+                profile.setHttpCacheMaximumSize(50 * 1024 * 1024)
             except Exception as exc:  # noqa: BLE001
                 logger.debug("Could not tune QWebEngineProfile: %s", exc)
-
-            # Final, and most important: keep Layer 1 above Layer 0.
-            # ``raise_`` is called once here and never again — touching
-            # the z-order at runtime is what caused the black-video
-            # bug during Phase 1.
+            # Raise once so when we DO show the overlay, it sits on
+            # top of everything — this is z-order discipline, not
+            # alpha-blending.
             self._web_view.raise_()
+            # Start hidden; the first real content (placeholder)
+            # shows it via ``_switch_to_overlay``.
+            self._web_view.hide()
 
-        # libmpv attaches to the video container's native HWND. Must
-        # happen after ``_video_container.winId()`` has been realised
-        # (Qt creates the native window lazily on the first winId()
-        # call, which our attribute flags above guarantee).
+        # --- libmpv attachment (must happen after the HWND exists) ---
         self._mpv = None
         mpv = _try_load_mpv(libmpv_dir, libmpv_app_data_dir, libmpv_auto_download)
         if mpv is not None:
@@ -281,10 +301,10 @@ class PlayerWindow(QWidget):
                 logger.warning("mpv initialisation failed: %s", exc)
                 self._mpv = None
 
+        # --- playlist / scheduling state ---
         self._playlist: list[PlaylistEntry] = []
         self._pending_playlist: Optional[list[PlaylistEntry]] = None
         self._index = 0
-        # Per-entry failure counters (reset on each playlist swap).
         self._failures: dict[int, int] = {}
         self._playlist_broken = False
 
@@ -292,10 +312,8 @@ class PlayerWindow(QWidget):
         self._advance_timer.setSingleShot(True)
         self._advance_timer.timeout.connect(self._advance)
 
-        # Track what the overlay is currently showing so the "clear the
-        # overlay when moving from widget → video" path can do the
-        # minimum work. ``None`` = untouched since startup; any other
-        # value is the source that's currently loaded.
+        # Track what the overlay currently shows so identical
+        # repaints are skipped (e.g. placeholder loaded once).
         self._overlay_signature: Optional[str] = None
 
         self._disable_close_shortcut()
@@ -306,32 +324,31 @@ class PlayerWindow(QWidget):
             self.resize(1280, 720)
             self.show()
 
-        # First overlay paint: the branded placeholder. Done after
-        # ``show`` so the web view has a surface to draw on.
+        # First frame: branded placeholder.
         self._show_placeholder("Waiting for schedule…")
 
-    # ----- resize handling (no layout manager for the overlay pair) -----
+    # ----- resize handling ---------------------------------------------
 
     def resizeEvent(self, event) -> None:  # noqa: N802
-        """Keep both surfaces filling the window on every resize."""
-        self._video_container.setGeometry(0, 0, self.width(), self.height())
+        """Keep every child filling the window on resize."""
+        w, h = self.width(), self.height()
+        self._video_container.setGeometry(0, 0, w, h)
+        self._image_label.setGeometry(0, 0, w, h)
         if self._web_view is not None:
-            self._web_view.setGeometry(0, 0, self.width(), self.height())
-            # ``raise_`` is idempotent; calling it after a resize is
-            # defensive in case a window manager on an exotic platform
-            # treats resize as a z-order reset.
-            self._web_view.raise_()
+            self._web_view.setGeometry(0, 0, w, h)
+            # Defensive: if the WM reset the z-order on resize (exotic
+            # on Windows but harmless to re-affirm) put the overlay
+            # back on top of its siblings. Only matters when it's
+            # currently visible — hidden views don't participate in
+            # z-order.
+            if self._web_view.isVisible():
+                self._web_view.raise_()
         super().resizeEvent(event)
 
-    # ----- public slots --------------------------------------------------
+    # ----- public slots ------------------------------------------------
 
     def set_playlist(self, entries: list[PlaylistEntry]) -> None:
-        """Queue a new playlist. It swaps in at the end of the current item.
-
-        Any previous "this playlist is broken" state is cleared because
-        a fresh manifest may include different media types that *can*
-        play.
-        """
+        """Queue a new playlist; swaps in at end-of-media."""
         if not entries:
             self._playlist = []
             self._pending_playlist = None
@@ -349,7 +366,6 @@ class PlayerWindow(QWidget):
             self._play_current()
             return
 
-        # Defer the swap until the current media ends.
         self._pending_playlist = entries
 
     def show_status(self, level: str, message: str) -> None:
@@ -361,27 +377,50 @@ class PlayerWindow(QWidget):
             message,
         )
 
-    # ----- internals -----------------------------------------------------
+    # ----- layer switching (the ONLY visibility mutation points) -----
 
-    def _disable_close_shortcut(self) -> None:
-        def _swallow() -> None:
-            pass
-
-        for seq in (QKeySequence("Alt+F4"), QKeySequence("Ctrl+W")):
-            shortcut = QShortcut(seq, self)
-            shortcut.activated.connect(_swallow)
-
-    # ---- Layer 0 (mpv) operations — NEVER touch the web view ----------
-
-    def _play_video_on_layer0(self, file_or_url: str) -> None:
-        """Send a video / stream to libmpv.
-
-        Intentionally does **not** mutate ``self._web_view``: the
-        overlay is whatever the previous ``_render`` call left there
-        (typically the placeholder or a transparent layout). Touching
-        the overlay on the video path is what caused the Phase-1
-        regression.
+    def _switch_to_video(self) -> None:
+        """Make libmpv the visible surface. Hides the web view (whose
+        opaque HWND would otherwise clip mpv on Windows) and the
+        image label.
         """
+        if self._web_view is not None and self._web_view.isVisible():
+            self._web_view.hide()
+        if self._image_label.isVisible():
+            self._image_label.hide()
+        if not self._video_container.isVisible():
+            self._video_container.show()
+
+    def _switch_to_image(self) -> None:
+        """Make the image label the visible surface."""
+        if self._web_view is not None and self._web_view.isVisible():
+            self._web_view.hide()
+        if not self._image_label.isVisible():
+            self._image_label.show()
+            self._image_label.raise_()
+
+    def _switch_to_overlay(self) -> None:
+        """Make the WebEngine view the visible surface.
+
+        Used for widgets and the branded placeholder. We re-raise on
+        every show so even if Windows reshuffled the z-order while
+        the view was hidden, it comes back on top.
+        """
+        if self._web_view is None:
+            # No WebEngine → fall back to image label showing nothing;
+            # the caller should treat this as a render error.
+            return
+        if self._image_label.isVisible():
+            self._image_label.hide()
+        if not self._web_view.isVisible():
+            self._web_view.show()
+        self._web_view.raise_()
+
+    # ----- content loaders (one per destination surface) -------------
+
+    def _play_video_on_mpv(self, file_or_url: str) -> None:
+        """Send a video / stream to libmpv. Caller must have already
+        called :meth:`_switch_to_video`."""
         if self._mpv is None:
             raise RuntimeError(
                 "libmpv not available — install libmpv-2.dll or run "
@@ -391,12 +430,7 @@ class PlayerWindow(QWidget):
         self._mpv.pause = False
 
     def _stop_video_layer(self) -> None:
-        """Stop libmpv playback, leaving the video container blank.
-
-        Called when the playlist empties so we don't keep the last
-        frame of the previous item on screen behind a transparent
-        overlay.
-        """
+        """Stop libmpv playback, leaving the container blank."""
         if self._mpv is None:
             return
         try:
@@ -404,67 +438,62 @@ class PlayerWindow(QWidget):
         except Exception as exc:  # noqa: BLE001
             logger.debug("mpv stop failed: %s", exc)
 
-    # ---- Layer 1 (overlay) operations — NEVER talk to libmpv ----------
+    def _load_image_on_label(self, path: Path) -> None:
+        """Paint a scaled QPixmap on the image label. Caller must have
+        already called :meth:`_switch_to_image`."""
+        pix = QPixmap(str(path))
+        if pix.isNull():
+            raise ValueError("Unable to load image")
+        scaled = pix.scaled(
+            self.size(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self._image_label.setPixmap(scaled)
 
     def _paint_overlay(self, html_document: str, *, signature: str) -> None:
-        """Replace the overlay with *html_document*.
+        """Replace the WebEngine document with *html_document*.
 
-        ``signature`` is an opaque string used to short-circuit
-        identical repaints (e.g. the placeholder is loaded once and
-        reused for every empty-playlist transition). Before every
-        load we wipe the WebEngine profile's in-memory cache + cookies
-        so long-running widget rotation can't grow the RSS unbounded.
+        Never called while ``_web_view.isVisible()`` is False is
+        SUFFICIENT but not required: Chromium paints off-screen views
+        correctly. We still flush its in-memory cache + cookies
+        before every load so a long-running kiosk can't balloon its
+        RSS via the overlay.
         """
         if self._web_view is None:
             return
         if self._overlay_signature == signature:
             return
-
         try:
             profile = self._web_view.page().profile()
             profile.clearHttpCache()
             profile.cookieStore().deleteAllCookies()
         except Exception as exc:  # noqa: BLE001
             logger.debug("Pre-load WebEngine cleanup failed: %s", exc)
-
-        # ``setHtml`` renders directly from the string; no temp file
-        # needed, no base URL needed for data-less placeholders.
         self._web_view.setHtml(html_document)
         self._overlay_signature = signature
 
-    def _show_placeholder(self, message: str = "ScreenView") -> None:
-        """Paint the branded fallback frame on the overlay.
+    # ----- high-level display helpers --------------------------------
 
-        Rendered as an opaque HTML panel so the video behind it
-        (whatever mpv happens to be holding) is hidden. The
-        placeholder is the only overlay state that's intentionally
-        opaque; every other state is transparent and lets Layer 0
-        show through.
-        """
+    def _show_placeholder(self, message: str = "ScreenView") -> None:
+        """Show the branded fallback frame on the overlay layer."""
         doc = render_placeholder_layout(
             message,
             resolution=(self.width() or 1920, self.height() or 1080),
         )
         self._paint_overlay(doc, signature=f"placeholder:{message}")
+        self._switch_to_overlay()
 
     def _show_image(self, path: Path) -> None:
-        """Paint a single full-canvas image on the overlay."""
-        src = ensure_absolute_url(str(path))
-        doc = render_single_image_layout(
-            src,
-            resolution=(self.width() or 1920, self.height() or 1080),
-        )
-        # ``path`` is a stable cache-dir filename (md5-based), so it
-        # makes a perfect signature for the short-circuit.
-        self._paint_overlay(doc, signature=f"image:{src}")
+        """Show an image on the QLabel layer."""
+        self._load_image_on_label(path)
+        self._switch_to_image()
 
     def _show_widget(self, path: Path) -> None:
-        """Paint a full-canvas HTML widget on the overlay.
+        """Show an HTML widget on the overlay layer.
 
-        Routed through the same layout pipeline as images/placeholder
-        so the whole pipeline has exactly one paint code path —
-        simpler, and easier to reason about for the no-more-black-
-        video invariant.
+        Routed through the layout renderer so widget rendering is
+        consistent with Phase 2 Layout/Zone future extensions.
         """
         src = ensure_absolute_url(str(path))
         doc = render_layout_html(
@@ -486,24 +515,9 @@ class PlayerWindow(QWidget):
             }
         )
         self._paint_overlay(doc, signature=f"widget:{src}")
+        self._switch_to_overlay()
 
-    def _clear_overlay_for_video(self) -> None:
-        """Make the overlay transparent so the video is visible.
-
-        Called once when switching **to** a video/stream entry. We
-        paint a no-zones layout: everything behind it (libmpv) is
-        visible because the HTML body has ``background: transparent``.
-        """
-        doc = render_layout_html(
-            {
-                "resolution_w": self.width() or 1920,
-                "resolution_h": self.height() or 1080,
-                "zones": [],
-            }
-        )
-        self._paint_overlay(doc, signature="video-transparent")
-
-    # ---- playlist cursor / advance logic ------------------------------
+    # ---- playlist cursor / advance logic ----------------------------
 
     def _play_current(self) -> None:
         if not self._playlist:
@@ -554,8 +568,7 @@ class PlayerWindow(QWidget):
 
         # Auto-advance policy:
         #   * Recorded videos: advance on libmpv's eof-reached event.
-        #   * Live streams: no natural EOF, so we *also* arm the
-        #     duration timer. Whichever fires first wins.
+        #   * Live streams: no natural EOF, arm duration timer.
         #   * Images / widgets: timer-driven.
         needs_timer = entry.kind != "video" or self._mpv is None
         if needs_timer:
@@ -575,7 +588,6 @@ class PlayerWindow(QWidget):
             )
         self._playlist_broken = True
         self._advance_timer.stop()
-        # Swap in any queued playlist immediately — it may fix the situation.
         if self._pending_playlist is not None:
             self._playlist = self._pending_playlist
             self._pending_playlist = None
@@ -587,50 +599,33 @@ class PlayerWindow(QWidget):
         self._stop_video_layer()
         self._show_placeholder("Content unavailable")
 
-    # ---- Render dispatch -----------------------------------------------
+    # ---- Render dispatch --------------------------------------------
 
     def _render(self, entry: PlaylistEntry) -> None:
-        """Dispatch a PlaylistEntry to Layer 0 (video) or Layer 1 (HTML).
-
-        Layering rule
-        -------------
-        * Every branch talks to **exactly one** of
-          ``_play_video_on_layer0`` / ``_paint_overlay`` (via the
-          ``_show_*`` helpers). Mixing the two layers from a single
-          branch is what would re-enable the Phase-1 black-video
-          regression on Windows.
-        * The ``video`` and ``stream`` branches additionally clear the
-          overlay to transparent so whatever was there (a previous
-          image, the placeholder) doesn't occlude libmpv.
-        * The static check in tests/test_render_video_isolation.py
-          pins these rules so a future refactor can't silently break
-          them.
-        """
+        """Dispatch to the right surface. Each branch calls exactly
+        one ``_switch_to_*`` + one content loader; never two layers'
+        content within a single branch."""
         path = entry.path
 
         if entry.kind == "image":
-            # Layer 1 only. Layer 0 keeps playing its last frame
-            # *underneath* but is fully occluded by the opaque-backed
-            # layout (we'd use a transparent canvas if we wanted to
-            # show the video through the image; that's Phase-4
-            # territory).
             if path is None:
                 raise ValueError("Image entry missing path")
             self._show_image(path)
             return
 
         if entry.kind == "video":
-            # Layer 0 only (for the loadfile call). Layer 1 is painted
-            # to transparent so the video is visible end-to-end.
-            self._play_video_on_layer0(str(path))
-            self._clear_overlay_for_video()
+            # Order matters on Windows: hide the web view BEFORE
+            # calling loadfile, so DWM stops clipping mpv's HWND
+            # before the new frames start coming in.
+            self._switch_to_video()
+            self._play_video_on_mpv(str(path))
             return
 
         if entry.kind == "stream":
             if not entry.stream_url:
                 raise ValueError("Stream item missing upstream URL")
-            self._play_video_on_layer0(entry.stream_url)
-            self._clear_overlay_for_video()
+            self._switch_to_video()
+            self._play_video_on_mpv(entry.stream_url)
             return
 
         if entry.kind == "widget":
@@ -663,10 +658,15 @@ class PlayerWindow(QWidget):
         if value:
             QTimer.singleShot(0, self._advance)
 
+    def _disable_close_shortcut(self) -> None:
+        def _swallow() -> None:
+            pass
+
+        for seq in (QKeySequence("Alt+F4"), QKeySequence("Ctrl+W")):
+            shortcut = QShortcut(seq, self)
+            shortcut.activated.connect(_swallow)
+
     def closeEvent(self, event) -> None:  # noqa: N802
-        # Tear down libmpv first — blocks a few hundred ms on decoder
-        # shutdown, which must happen before we release the WebEngine
-        # or Qt's display server resources.
         if self._mpv is not None:
             try:
                 self._mpv.terminate()
