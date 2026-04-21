@@ -169,6 +169,17 @@ See `player-windows/README.md` for the full kiosk lockdown checklist.
    every page as an ordinary image `Media` row. The player sees
    normal images; the rest of the pipeline (cache, MD5, signed URLs,
    preview) works unchanged.
+8. **Layered player UI (Phase 2).** The Windows player composes two
+   **permanently-visible** surfaces: libmpv's hardware video output
+   on the bottom layer, a transparent `QWebEngineView` on top. All
+   image / widget / text / placeholder content is rendered as HTML
+   into the overlay; the overlay's transparent zones let the video
+   show through. The overlay's z-order is set **once** at startup —
+   runtime mutation of the web view is what caused the Phase 1
+   "audio plays, picture is black" bug on Windows. See
+   `player-windows/layout_html.py` for the renderer and
+   `tests/test_render_video_isolation.py` for the guard-rail
+   assertions that pin the invariant.
 
 ## Security model
 
