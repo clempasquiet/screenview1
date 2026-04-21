@@ -390,13 +390,16 @@ def test_schedule_item_rejects_unknown_layout_id(client: TestClient) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_layout_slots_are_skipped_in_manifest_and_preview(client: TestClient) -> None:
+def test_mixed_schedule_emits_both_slot_shapes_in_manifest(client: TestClient) -> None:
+    """Before Step 4 the manifest was a flat list and Layout slots
+    were silently skipped. After Step 4 the manifest is a tree, and
+    BOTH slot shapes (legacy single-media, new layout) are emitted as
+    their own slides — legacy wrapped in a synthetic one-zone
+    full-screen layout, new layouts emitted as-is with their zones."""
     headers = _admin_auth(client)
     layout = _create_layout(client, headers, name="Phase2Only")
     media_id = _upload_image(client, "legacy.png", b"legacy")
 
-    # Register a device and give it a schedule mixing a legacy media
-    # slot and a layout slot.
     reg = client.post("/api/register", json={"mac_address": "de:ad:be:ef:00:01"}).json()
     token = reg["api_token"]
 
@@ -423,11 +426,31 @@ def test_layout_slots_are_skipped_in_manifest_and_preview(client: TestClient) ->
     manifest = client.get(
         f"/api/schedule/{reg['id']}", headers=_device_auth(token)
     ).json()
-    # Only the legacy media slot made it into the manifest. The Layout
-    # slot is silently skipped because Step 4 has not landed yet.
-    assert len(manifest["items"]) == 1
-    assert manifest["items"][0]["media_id"] == media_id
+    # Two slides, in order.
+    assert len(manifest["slides"]) == 2
 
+    # Slide 0: legacy single-media slot → synthetic layout.
+    s0 = manifest["slides"][0]
+    assert s0["order"] == 0
+    assert s0["duration"] == 4
+    assert s0["layout"]["layout_id"] is None
+    assert len(s0["layout"]["zones"]) == 1
+    z0 = s0["layout"]["zones"][0]
+    assert z0["zone_id"] is None
+    assert z0["items"][0]["media_id"] == media_id
+
+    # Slide 1: real layout slot → real layout with real zones.
+    s1 = manifest["slides"][1]
+    assert s1["order"] == 1
+    assert s1["duration"] == 10
+    assert s1["layout"]["layout_id"] == layout["id"]
+    # The empty layout created by _create_layout has no zones; that's
+    # a valid state — the player will render a blank frame.
+    assert s1["layout"]["zones"] == []
+
+    # The legacy *preview* endpoint still exists and still emits the
+    # old flat shape — it's for the CMS preview modal which hasn't
+    # been ported to layouts yet. It continues to skip layout slots.
     preview = client.get(
         f"/api/schedules/{schedule_id}/preview", headers=headers
     ).json()

@@ -1,18 +1,16 @@
 """Kiosk-mode UI for the ScreenView Windows player.
 
-Phase 2 Step 3 originally proposed a truly layered design (libmpv on
-the bottom, a *transparent* ``QWebEngineView`` permanently on top). On
-Linux/macOS that works because compositing is done by the window
-manager with per-pixel alpha between sibling HWNDs. On Windows it
-does NOT work: DWM does not alpha-blend a Chromium HWND over a sibling
-HWND in the same top-level window, so the web view ends up opaquely
-clipping mpv behind it — producing audio-only playback. We hit the
-symptom on a real kiosk.
+Phase 2 Step 4 architecture — Layout-aware rendering
+====================================================
 
-Revised architecture (this file)
-================================
-Three surfaces, **exactly one visible at any given moment**, and a
-strict discipline on who owns which transitions:
+The player now consumes a tree-shaped manifest (see
+``server/schemas.py :: LayoutManifest``): a list of *slides*, each
+carrying a *layout* with one or more *zones*, each zone holding an
+ordered playlist of media items. Every slide has a global duration;
+the player cycles slide-by-slide, not item-by-item.
+
+Single-visible-surface dispatch (from PR #17 / #15) is preserved.
+Three full-window children, exactly one visible at any moment:
 
     ┌────────────────────────────────────────────┐
     │  self (QWidget, frameless, always-on-top)  │
@@ -23,55 +21,53 @@ strict discipline on who owns which transitions:
     │                                            │
     └────────────────────────────────────────────┘
 
-All three children share the same geometry (full window). At any
-point exactly one is visible; the other two are hidden. Transitions
-go through three private helpers:
+Visibility transitions go through ``_switch_to_video`` /
+``_switch_to_image`` / ``_switch_to_overlay`` helpers. We tried a
+truly layered design (transparent WebEngine over libmpv) three times
+in Phase 2; DWM on Windows does not alpha-blend sibling HWNDs so a
+visible web view would always occlude mpv. See README principle 8.
 
-  * ``_switch_to_video()``    — hide web view + label; mpv shows.
-  * ``_switch_to_image()``    — show label (opaque), hide web view;
-                                 mpv keeps running behind but is
-                                 occluded by the label.
-  * ``_switch_to_overlay()``  — show web view (opaque or transparent
-                                 depending on page), hide label.
+Slide dispatch (three branches, with the mixed-layout trade-off)
+----------------------------------------------------------------
 
-The web view's stacking is set **once** at startup via ``raise_()``
-so the previous black-video regression (reshuffling z-order at
-runtime) cannot return. The child visibility toggles are the only
-runtime z-order mutation we tolerate — and they never touch the
-contents of a hidden view.
+For each slide the player picks one of three rendering paths:
 
-Layered rendering for true overlay-on-video (text over a playing
-clip) is left for a future PR that migrates mpv to
-``QOpenGLWidget + mpv.render_api`` so compositing happens within a
-single GL surface. That is a larger change that needs a real Windows
-kiosk in the loop, so it's out of scope here.
+  1. **Pure image** (single zone, single image item, full-canvas) →
+     ``_switch_to_image`` + ``QLabel.setPixmap``. Cheapest, sharpest,
+     used whenever the slide's shape matches (covers all pre-Phase-2
+     legacy playlists).
 
-Runtime contract
-================
-External interface is unchanged:
+  2. **HTML-only layout** (no video/stream anywhere in the slide) →
+     ``_switch_to_overlay`` + ``render_layout_html``. Multi-zone
+     composition with absolute-positioned divs for images, widgets
+     (iframes with sandbox), and text. Zone geometry is preserved.
 
-  * ``PlayerWindow(fullscreen=..., show_cursor=..., …)``
-  * ``.set_playlist(entries: list[PlaylistEntry])`` — queue the next
-    playlist; swaps in at end-of-media for gapless transitions.
-  * ``.show_status(level, message)`` — log sink the worker signals to.
+  3. **Video-bearing slide** (any zone contains a video or stream) →
+     ``_switch_to_video`` + ``mpv.loadfile`` on the FIRST video/stream
+     item encountered. The video plays **full-screen** with loop,
+     other zones are dropped with a warning log.
 
-``PlaylistEntry.kind`` takes values ``image`` / ``video`` /
-``stream`` / ``widget``; this PR does not change the manifest format.
+     This is the documented Phase 2 trade-off: proper video-in-zone
+     compositing requires migrating mpv to ``mpv.render_api`` +
+     ``QOpenGLWidget`` so everything lives in one GL surface.
+     Deferred until a concrete use case requires it — see README
+     principle 8 for the (a)/(b) discussion.
 
-Failure handling (from Phase 1, preserved)
-==========================================
-  * Each entry tracks a failure count; after ``MAX_ITEM_FAILURES``
-    failures the entry is skipped for the rest of that playlist.
-  * If every entry fails we fall back to the placeholder until a new
-    manifest arrives.
+Timer
+-----
 
-Memory hygiene (from Phase 1 Fix 3, preserved here)
-===================================================
-  * WebEngine profile configured at startup with ``MemoryHttpCache``
-    + ``NoPersistentCookies`` + a 50 MiB ceiling.
-  * We wipe the profile's in-memory cache + cookies before every
-    widget / placeholder load.
-  * ``closeEvent`` performs a final teardown.
+Auto-advance is driven by ``slide.duration`` — the server-computed
+total on-screen time for the slide — not per-item timings. Video
+slides loop the playing clip for the full slide duration so a short
+clip in a long slot doesn't freeze on its last frame.
+
+Failure handling (preserved)
+----------------------------
+
+Each slide carries a failure counter keyed on ``slide_id``. After
+``MAX_SLIDE_FAILURES`` consecutive render failures on the same
+slide we skip it for the rest of the playlist; if every slide fails
+we fall back to the placeholder until a new manifest arrives.
 """
 from __future__ import annotations
 
@@ -103,19 +99,20 @@ from layout_html import (
     ensure_absolute_url,
     render_layout_html,
     render_placeholder_layout,
+    render_single_image_layout,
 )
 from libmpv_fetch import ensure_libmpv
-from worker_network import PlaylistEntry
+from worker_network import Slide, Zone, ZoneItem
 
 logger = logging.getLogger(__name__)
 
 
-# Maximum number of consecutive render failures we accept for a single entry
-# before permanently skipping it within the current playlist.
-MAX_ITEM_FAILURES = 2
+# Maximum number of consecutive render failures we accept for a single
+# slide before permanently skipping it within the current playlist.
+MAX_SLIDE_FAILURES = 2
 
-# Retry/backoff used after any render failure. Keeps the UI thread sane and
-# the logs readable.
+# Retry/backoff used after any render failure. Keeps the UI thread sane
+# and the logs readable.
 RENDER_ERROR_RETRY_MS = 2000
 MIN_DURATION_MS = 1000
 
@@ -205,15 +202,8 @@ def _try_load_mpv(
 class PlayerWindow(QWidget):
     """Fullscreen, borderless, always-on-top kiosk window.
 
-    Children (all full-window, exactly one visible at any moment):
-
-      * ``_video_container`` — native QWidget hosting libmpv.
-      * ``_image_label``     — QLabel that renders the current image.
-      * ``_web_view``        — QWebEngineView for widgets + placeholder.
-
-    The ``_switch_to_*`` helpers are the only code paths allowed to
-    mutate child visibility. ``_render`` calls exactly one of them per
-    entry, immediately before handing content to the surface.
+    Consumes ``list[Slide]`` playlists emitted by the network worker.
+    See the module docstring for the slide-dispatch contract.
     """
 
     def __init__(
@@ -226,7 +216,6 @@ class PlayerWindow(QWidget):
     ) -> None:
         super().__init__()
         self.setWindowTitle("ScreenView Player")
-        self.setStyleSheet("background-color: #000; color: #e6e8ef;")
         flags = Qt.WindowType.FramelessWindowHint
         if fullscreen:
             flags |= Qt.WindowType.WindowStaysOnTopHint
@@ -234,38 +223,31 @@ class PlayerWindow(QWidget):
         if not show_cursor:
             self.setCursor(Qt.CursorShape.BlankCursor)
 
+        # Top-level window is opaque black. DO NOT make this
+        # translucent — it breaks the HWND-level compositing the
+        # children rely on. See README principle 8.
+        self.setStyleSheet("background-color: black;")
+
         # --- Layer A: native container for libmpv ---
-        # WA_NativeWindow guarantees Qt creates the HWND up-front so
-        # libmpv can attach via winId(). WA_DontCreateNativeAncestors
-        # keeps the parent chain logical (non-native) — that's how the
-        # video container stays cleanly addressable by mpv without
-        # forcing the whole tree into native windows.
         self._video_container = QWidget(self)
-        self._video_container.setStyleSheet("background-color: #000;")
+        self._video_container.setStyleSheet("background-color: black;")
         self._video_container.setAttribute(Qt.WidgetAttribute.WA_DontCreateNativeAncestors)
         self._video_container.setAttribute(Qt.WidgetAttribute.WA_NativeWindow)
 
-        # --- Layer B: QLabel for images ---
-        # Kept separate from the WebEngine on purpose. Putting images
-        # through Chromium is fine visually but has a side-effect we
-        # care about on Windows: a *visible* QWebEngineView sibling
-        # will clip a libmpv HWND even with WA_TranslucentBackground
-        # set, because DWM doesn't alpha-blend sibling HWNDs. So we
-        # use the label for images (cheap, opaque by design) and only
-        # wake the WebEngine for widgets + placeholder.
+        # --- Layer B: QLabel for single images ---
+        # Stays on the QLabel path rather than going through the
+        # WebEngine so the fast-path for plain-image playlists does
+        # not have to wake Chromium's HWND.
         self._image_label = QLabel(self)
         self._image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._image_label.setStyleSheet("background-color: #000;")
+        self._image_label.setStyleSheet("background-color: black;")
         self._image_label.hide()
 
-        # --- Layer C: QWebEngineView for widgets + placeholder ---
+        # --- Layer C: QWebEngineView for widgets + multi-zone HTML + placeholder ---
         self._web_view: QWebEngineView | None = None
         if HAS_WEBENGINE:
             self._web_view = QWebEngineView(self)
-            # Still set background attributes for cleanliness; they
-            # don't help with the DWM issue but keep the rendered
-            # page consistent when it IS on screen.
-            self._web_view.setStyleSheet("background-color: #000;")
+            self._web_view.setStyleSheet("background-color: black;")
             try:
                 profile = self._web_view.page().profile()
                 profile.setHttpCacheType(QWebEngineProfile.HttpCacheType.MemoryHttpCache)
@@ -275,12 +257,7 @@ class PlayerWindow(QWidget):
                 profile.setHttpCacheMaximumSize(50 * 1024 * 1024)
             except Exception as exc:  # noqa: BLE001
                 logger.debug("Could not tune QWebEngineProfile: %s", exc)
-            # Raise once so when we DO show the overlay, it sits on
-            # top of everything — this is z-order discipline, not
-            # alpha-blending.
             self._web_view.raise_()
-            # Start hidden; the first real content (placeholder)
-            # shows it via ``_switch_to_overlay``.
             self._web_view.hide()
 
         # --- libmpv attachment (must happen after the HWND exists) ---
@@ -296,24 +273,24 @@ class PlayerWindow(QWidget):
                     loop_file="no",
                     osc=False,
                 )
-                self._mpv.observe_property("eof-reached", self._on_mpv_eof)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("mpv initialisation failed: %s", exc)
                 self._mpv = None
 
         # --- playlist / scheduling state ---
-        self._playlist: list[PlaylistEntry] = []
-        self._pending_playlist: Optional[list[PlaylistEntry]] = None
+        self._playlist: list[Slide] = []
+        self._pending_playlist: Optional[list[Slide]] = None
         self._index = 0
-        self._failures: dict[int, int] = {}
+        # Failure counters keyed by slide_id so cross-playlist swaps
+        # don't bleed state between runs.
+        self._failures: dict[str, int] = {}
         self._playlist_broken = False
 
         self._advance_timer = QTimer(self)
         self._advance_timer.setSingleShot(True)
         self._advance_timer.timeout.connect(self._advance)
 
-        # Track what the overlay currently shows so identical
-        # repaints are skipped (e.g. placeholder loaded once).
+        # Short-circuit identical repaints.
         self._overlay_signature: Optional[str] = None
 
         self._disable_close_shortcut()
@@ -324,7 +301,6 @@ class PlayerWindow(QWidget):
             self.resize(1280, 720)
             self.show()
 
-        # First frame: branded placeholder.
         self._show_placeholder("Waiting for schedule…")
 
     # ----- resize handling ---------------------------------------------
@@ -336,20 +312,20 @@ class PlayerWindow(QWidget):
         self._image_label.setGeometry(0, 0, w, h)
         if self._web_view is not None:
             self._web_view.setGeometry(0, 0, w, h)
-            # Defensive: if the WM reset the z-order on resize (exotic
-            # on Windows but harmless to re-affirm) put the overlay
-            # back on top of its siblings. Only matters when it's
-            # currently visible — hidden views don't participate in
-            # z-order.
             if self._web_view.isVisible():
                 self._web_view.raise_()
         super().resizeEvent(event)
 
     # ----- public slots ------------------------------------------------
 
-    def set_playlist(self, entries: list[PlaylistEntry]) -> None:
-        """Queue a new playlist; swaps in at end-of-media."""
-        if not entries:
+    def set_playlist(self, slides: list[Slide]) -> None:
+        """Queue a new Layout-tree playlist; swaps in at end of current slide.
+
+        Accepts the output of ``NetworkWorker.playlist_ready`` — a
+        list of :class:`worker_network.Slide`. Empty list means "no
+        schedule assigned": stop video, show the placeholder.
+        """
+        if not slides:
             self._playlist = []
             self._pending_playlist = None
             self._failures.clear()
@@ -359,14 +335,15 @@ class PlayerWindow(QWidget):
             return
 
         if not self._playlist or self._playlist_broken:
-            self._playlist = entries
+            self._playlist = slides
             self._index = 0
             self._failures.clear()
             self._playlist_broken = False
             self._play_current()
             return
 
-        self._pending_playlist = entries
+        # Defer: finish the current slide before swapping.
+        self._pending_playlist = slides
 
     def show_status(self, level: str, message: str) -> None:
         logger.log(
@@ -377,13 +354,10 @@ class PlayerWindow(QWidget):
             message,
         )
 
-    # ----- layer switching (the ONLY visibility mutation points) -----
+    # ----- Layer switching (only visibility mutation points) ----------
 
     def _switch_to_video(self) -> None:
-        """Make libmpv the visible surface. Hides the web view (whose
-        opaque HWND would otherwise clip mpv on Windows) and the
-        image label.
-        """
+        """Make libmpv the visible surface."""
         if self._web_view is not None and self._web_view.isVisible():
             self._web_view.hide()
         if self._image_label.isVisible():
@@ -402,13 +376,12 @@ class PlayerWindow(QWidget):
     def _switch_to_overlay(self) -> None:
         """Make the WebEngine view the visible surface.
 
-        Used for widgets and the branded placeholder. We re-raise on
-        every show so even if Windows reshuffled the z-order while
-        the view was hidden, it comes back on top.
+        Used for multi-zone layouts, single widgets, and the branded
+        placeholder. We re-raise on every show so even if Windows
+        reshuffled the z-order while the view was hidden, it comes
+        back on top.
         """
         if self._web_view is None:
-            # No WebEngine → fall back to image label showing nothing;
-            # the caller should treat this as a render error.
             return
         if self._image_label.isVisible():
             self._image_label.hide()
@@ -416,21 +389,30 @@ class PlayerWindow(QWidget):
             self._web_view.show()
         self._web_view.raise_()
 
-    # ----- content loaders (one per destination surface) -------------
+    # ----- Layer A: libmpv controls -----------------------------------
 
-    def _play_video_on_mpv(self, file_or_url: str) -> None:
-        """Send a video / stream to libmpv. Caller must have already
-        called :meth:`_switch_to_video`."""
+    def _play_video_on_mpv(self, file_or_url: str, *, loop: bool = False) -> None:
+        """Send a video/stream to libmpv.
+
+        When ``loop`` is True, the clip loops forever until the slide
+        timer expires or we move on. This is the right default for
+        signage slides with a slot duration longer than the clip
+        itself — otherwise mpv would freeze on the last frame.
+        """
         if self._mpv is None:
             raise RuntimeError(
                 "libmpv not available — install libmpv-2.dll or run "
                 "scripts\\fetch-libmpv.ps1"
             )
+        try:
+            self._mpv.loop_file = "inf" if loop else "no"
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("mpv loop_file set failed: %s", exc)
         self._mpv.loadfile(file_or_url, mode="replace")
         self._mpv.pause = False
 
     def _stop_video_layer(self) -> None:
-        """Stop libmpv playback, leaving the container blank."""
+        """Stop libmpv playback."""
         if self._mpv is None:
             return
         try:
@@ -438,28 +420,10 @@ class PlayerWindow(QWidget):
         except Exception as exc:  # noqa: BLE001
             logger.debug("mpv stop failed: %s", exc)
 
-    def _load_image_on_label(self, path: Path) -> None:
-        """Paint a scaled QPixmap on the image label. Caller must have
-        already called :meth:`_switch_to_image`."""
-        pix = QPixmap(str(path))
-        if pix.isNull():
-            raise ValueError("Unable to load image")
-        scaled = pix.scaled(
-            self.size(),
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-        self._image_label.setPixmap(scaled)
+    # ----- Layer C: WebEngine overlay ---------------------------------
 
     def _paint_overlay(self, html_document: str, *, signature: str) -> None:
-        """Replace the WebEngine document with *html_document*.
-
-        Never called while ``_web_view.isVisible()`` is False is
-        SUFFICIENT but not required: Chromium paints off-screen views
-        correctly. We still flush its in-memory cache + cookies
-        before every load so a long-running kiosk can't balloon its
-        RSS via the overlay.
-        """
+        """Replace the overlay document, skipping identical repaints."""
         if self._web_view is None:
             return
         if self._overlay_signature == signature:
@@ -473,10 +437,9 @@ class PlayerWindow(QWidget):
         self._web_view.setHtml(html_document)
         self._overlay_signature = signature
 
-    # ----- high-level display helpers --------------------------------
+    # ----- high-level display helpers ---------------------------------
 
     def _show_placeholder(self, message: str = "ScreenView") -> None:
-        """Show the branded fallback frame on the overlay layer."""
         doc = render_placeholder_layout(
             message,
             resolution=(self.width() or 1920, self.height() or 1080),
@@ -485,105 +448,132 @@ class PlayerWindow(QWidget):
         self._switch_to_overlay()
 
     def _show_image(self, path: Path) -> None:
-        """Show an image on the QLabel layer."""
-        self._load_image_on_label(path)
+        """Render one image on the QLabel fast path."""
+        pix = QPixmap(str(path))
+        if pix.isNull():
+            raise ValueError("Unable to load image")
+        scaled = pix.scaled(
+            self.size(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self._image_label.setPixmap(scaled)
         self._switch_to_image()
 
-    def _show_widget(self, path: Path) -> None:
-        """Show an HTML widget on the overlay layer.
+    def _show_layout_html(self, slide: Slide) -> None:
+        """Render a multi-zone layout via the HTML overlay.
 
-        Routed through the layout renderer so widget rendering is
-        consistent with Phase 2 Layout/Zone future extensions.
+        Each zone becomes an absolutely-positioned ``<div>`` using
+        the layout's authoring resolution as the coordinate space.
+        Items' first-in-order is picked to represent each zone (a
+        zone's own mini-playlist rotation is a later increment
+        that would need per-zone timers inside the HTML; not in
+        this PR).
         """
-        src = ensure_absolute_url(str(path))
+        if self._web_view is None:
+            raise RuntimeError("QWebEngineView not available — cannot render layouts")
+
+        zones_dict = []
+        for zone in slide.zones:
+            if not zone.items:
+                # Empty zone → leave a transparent placeholder region.
+                zones_dict.append(_zone_to_dict(zone, kind="empty", payload={}))
+                continue
+            # For now pick the first item in the zone. Zone-level
+            # playlists will get their own timers in a follow-up.
+            item = zone.items[0]
+            if item.kind == "image":
+                src = ensure_absolute_url(str(item.path)) if item.path else ""
+                zones_dict.append(_zone_to_dict(zone, kind="image", payload={"src": src}))
+            elif item.kind == "widget":
+                src = ensure_absolute_url(str(item.path)) if item.path else ""
+                zones_dict.append(_zone_to_dict(zone, kind="widget", payload={"src": src}))
+            else:
+                # video/stream items in an HTML-only slide shouldn't
+                # reach this code path — the dispatcher routes video-
+                # bearing slides to the mpv layer instead. If it does
+                # (e.g. a stream with no URL), render an empty zone.
+                logger.warning(
+                    "Zone %s has a %s item in an HTML-only render path; "
+                    "rendering as empty.",
+                    zone.name, item.kind,
+                )
+                zones_dict.append(_zone_to_dict(zone, kind="empty", payload={}))
+
         doc = render_layout_html(
             {
-                "resolution_w": self.width() or 1920,
-                "resolution_h": self.height() or 1080,
-                "zones": [
-                    {
-                        "id": "widget-fullscreen",
-                        "kind": "widget",
-                        "position_x": 0,
-                        "position_y": 0,
-                        "width": self.width() or 1920,
-                        "height": self.height() or 1080,
-                        "z_index": 0,
-                        "src": src,
-                    }
-                ],
+                "resolution_w": slide.resolution_w,
+                "resolution_h": slide.resolution_h,
+                "zones": zones_dict,
             }
         )
-        self._paint_overlay(doc, signature=f"widget:{src}")
+        # Signature: slide_id + the zone content hashes so a cycle
+        # through identical slides doesn't trigger useless reloads.
+        self._paint_overlay(doc, signature=f"slide:{slide.slide_id}")
         self._switch_to_overlay()
 
-    # ---- playlist cursor / advance logic ----------------------------
+    # ---- playlist cursor / advance logic -----------------------------
 
     def _play_current(self) -> None:
         if not self._playlist:
             self._show_placeholder()
             return
 
-        # Skip entries that have already exceeded their failure budget.
+        # Skip slides that have already exceeded their failure budget.
         start = self._index
         n = len(self._playlist)
         attempts = 0
         while attempts < n:
-            entry = self._playlist[self._index]
-            if self._failures.get(id(entry), 0) < MAX_ITEM_FAILURES:
+            slide = self._playlist[self._index]
+            if self._failures.get(slide.slide_id, 0) < MAX_SLIDE_FAILURES:
                 break
             self._index = (self._index + 1) % n
             attempts += 1
             if self._index == start:
                 break
 
-        entry = self._playlist[self._index]
-        if self._failures.get(id(entry), 0) >= MAX_ITEM_FAILURES:
+        slide = self._playlist[self._index]
+        if self._failures.get(slide.slide_id, 0) >= MAX_SLIDE_FAILURES:
             self._mark_playlist_broken()
             return
 
         self._advance_timer.stop()
         try:
-            self._render(entry)
+            self._render_slide(slide)
         except Exception as exc:  # noqa: BLE001
-            fails = self._failures.get(id(entry), 0) + 1
-            self._failures[id(entry)] = fails
+            fails = self._failures.get(slide.slide_id, 0) + 1
+            self._failures[slide.slide_id] = fails
             logger.warning(
-                "Render failed for %s (%s/%s): %s",
-                entry.original_name,
-                fails,
-                MAX_ITEM_FAILURES,
-                exc,
+                "Render failed for slide %s (%s/%s): %s",
+                slide.slide_id, fails, MAX_SLIDE_FAILURES, exc,
             )
             self.show_status(
-                "warn",
-                f"Render failed for {entry.original_name}: {exc}",
+                "warn", f"Render failed for slide {slide.slide_id}: {exc}",
             )
-            if fails >= MAX_ITEM_FAILURES and self._all_entries_broken():
+            if fails >= MAX_SLIDE_FAILURES and self._all_slides_broken():
                 self._mark_playlist_broken()
                 return
             self._index = (self._index + 1) % len(self._playlist)
             QTimer.singleShot(RENDER_ERROR_RETRY_MS, self._play_current)
             return
 
-        # Auto-advance policy:
-        #   * Recorded videos: advance on libmpv's eof-reached event.
-        #   * Live streams: no natural EOF, arm duration timer.
-        #   * Images / widgets: timer-driven.
-        needs_timer = entry.kind != "video" or self._mpv is None
-        if needs_timer:
-            duration_ms = max(MIN_DURATION_MS, entry.duration * 1000)
-            self._advance_timer.start(duration_ms)
+        # Global slide timer drives every transition. Even video-
+        # bearing slides are timer-driven: mpv loops the clip inside
+        # the slot so a short clip in a long slot doesn't freeze on
+        # its last frame.
+        duration_ms = max(MIN_DURATION_MS, slide.duration * 1000)
+        self._advance_timer.start(duration_ms)
 
-    def _all_entries_broken(self) -> bool:
+    def _all_slides_broken(self) -> bool:
         return all(
-            self._failures.get(id(e), 0) >= MAX_ITEM_FAILURES for e in self._playlist
+            self._failures.get(s.slide_id, 0) >= MAX_SLIDE_FAILURES
+            for s in self._playlist
         )
 
     def _mark_playlist_broken(self) -> None:
         if not self._playlist_broken:
             logger.error(
-                "Every item in the current playlist failed to render; "
+                "Every slide in the current playlist failed to render; "
                 "holding on the placeholder until a new manifest arrives."
             )
         self._playlist_broken = True
@@ -599,44 +589,64 @@ class PlayerWindow(QWidget):
         self._stop_video_layer()
         self._show_placeholder("Content unavailable")
 
-    # ---- Render dispatch --------------------------------------------
+    # ---- Render dispatch ---------------------------------------------
 
-    def _render(self, entry: PlaylistEntry) -> None:
-        """Dispatch to the right surface. Each branch calls exactly
-        one ``_switch_to_*`` + one content loader; never two layers'
-        content within a single branch."""
-        path = entry.path
+    def _render_slide(self, slide: Slide) -> None:
+        """Pick one of three render paths based on slide shape.
 
-        if entry.kind == "image":
-            if path is None:
-                raise ValueError("Image entry missing path")
-            self._show_image(path)
-            return
+        The picks are intentionally conservative (prefer the simplest
+        path that matches) and each path leaves the other two
+        surfaces in a consistent "off" state.
+        """
 
-        if entry.kind == "video":
-            # Order matters on Windows: hide the web view BEFORE
-            # calling loadfile, so DWM stops clipping mpv's HWND
-            # before the new frames start coming in.
+        # Case 3 (checked first — wins over multi-zone composition per
+        # the documented Phase 2 trade-off): any video or stream item
+        # in the slide plays full-screen, other zones omitted.
+        if slide.has_video:
+            item = slide.first_video_item()
+            assert item is not None  # has_video invariant
+            dropped_count = sum(len(z.items) for z in slide.zones) - 1
+            if dropped_count > 0:
+                logger.warning(
+                    "Slide %s: playing %s full-screen; %d other zone item(s) "
+                    "omitted (single-visible-surface constraint, see README "
+                    "principle 8).",
+                    slide.slide_id, item.kind, dropped_count,
+                )
             self._switch_to_video()
-            self._play_video_on_mpv(str(path))
+            # Loop the clip so a short video doesn't freeze in a long
+            # slot. Streams loop implicitly (mpv keeps the last frame
+            # until the remote end sends more).
+            loop_it = item.kind == "video" and item.duration < slide.duration
+            if item.kind == "video":
+                if item.path is None:
+                    raise ValueError("Video item missing cached path")
+                self._play_video_on_mpv(str(item.path), loop=loop_it)
+            else:  # stream
+                if not item.stream_url:
+                    raise ValueError("Stream item missing upstream URL")
+                self._play_video_on_mpv(item.stream_url, loop=False)
             return
 
-        if entry.kind == "stream":
-            if not entry.stream_url:
-                raise ValueError("Stream item missing upstream URL")
-            self._switch_to_video()
-            self._play_video_on_mpv(entry.stream_url)
+        # Case 1 (fast path): single zone, single image, full-canvas.
+        # Matches all legacy single-media slots as well as authored
+        # single-image layouts.
+        if (
+            len(slide.zones) == 1
+            and len(slide.zones[0].items) == 1
+            and slide.zones[0].items[0].kind == "image"
+            and _zone_is_full_canvas(slide.zones[0], slide.resolution_w, slide.resolution_h)
+        ):
+            item = slide.zones[0].items[0]
+            if item.path is None:
+                raise ValueError("Image item missing cached path")
+            self._stop_video_layer()
+            self._show_image(item.path)
             return
 
-        if entry.kind == "widget":
-            if self._web_view is None:
-                raise RuntimeError("QWebEngineView not available")
-            if path is None:
-                raise ValueError("Widget entry missing path")
-            self._show_widget(path)
-            return
-
-        raise ValueError(f"Unknown media kind: {entry.kind}")
+        # Case 2: any other HTML-only slide → multi-zone layout HTML.
+        self._stop_video_layer()
+        self._show_layout_html(slide)
 
     def _advance(self) -> None:
         if not self._playlist:
@@ -653,10 +663,6 @@ class PlayerWindow(QWidget):
             else:
                 self._index = 0
         self._play_current()
-
-    def _on_mpv_eof(self, _name: str, value: bool) -> None:  # noqa: FBT001
-        if value:
-            QTimer.singleShot(0, self._advance)
 
     def _disable_close_shortcut(self) -> None:
         def _swallow() -> None:
@@ -691,6 +697,38 @@ class PlayerWindow(QWidget):
             gc.collect()
 
         super().closeEvent(event)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _zone_is_full_canvas(zone: Zone, canvas_w: int, canvas_h: int) -> bool:
+    """True if ``zone`` covers the whole authoring canvas at (0,0)."""
+    return (
+        zone.position_x == 0
+        and zone.position_y == 0
+        and zone.width == canvas_w
+        and zone.height == canvas_h
+    )
+
+
+def _zone_to_dict(zone: Zone, *, kind: str, payload: dict) -> dict:
+    """Turn a :class:`Zone` into the dict shape ``render_layout_html``
+    expects. Layer the kind + payload over the zone's geometry."""
+    base = {
+        "id": zone.zone_id if zone.zone_id is not None else zone.name,
+        "kind": kind,
+        "name": zone.name,
+        "position_x": zone.position_x,
+        "position_y": zone.position_y,
+        "width": zone.width,
+        "height": zone.height,
+        "z_index": zone.z_index,
+    }
+    base.update(payload)
+    return base
 
 
 def screen_size() -> QSize:

@@ -18,10 +18,13 @@ from ..device_auth import (
     sign_admin_preview_url,
     sign_media_url,
 )
-from ..models import Device, Layout, Media, MediaType, Schedule, ScheduleItem
+from ..models import Device, Layout, Media, MediaType, Schedule, ScheduleItem, Zone, ZoneItem
 from ..schemas import (
-    PlaylistManifest,
-    PlaylistManifestItem,
+    LayoutManifest,
+    ManifestLayout,
+    ManifestSlide,
+    ManifestZone,
+    ManifestZoneItem,
     ScheduleCreate,
     ScheduleItemIn,
     SchedulePreview,
@@ -290,80 +293,274 @@ async def publish_schedule(
     return {"devices": len(devices), "notified": notified}
 
 
-@router.get("/schedule/{device_id}", response_model=PlaylistManifest)
+# ---------------------------------------------------------------------------
+# Layout-tree manifest (Phase 2 Step 4)
+# ---------------------------------------------------------------------------
+
+
+# Default canvas when wrapping a legacy single-media slot in a synthetic
+# layout. 1920×1080 matches the vast majority of signage displays; the
+# player scales the layout to its actual screen with ``object-fit:
+# contain`` semantics so this is a safe default.
+_SYNTHETIC_CANVAS_W = 1920
+_SYNTHETIC_CANVAS_H = 1080
+
+
+def _build_zone_item(
+    base_url: str,
+    device: Device,
+    media: Media,
+    *,
+    order: int,
+    duration_override: int | None,
+) -> ManifestZoneItem | None:
+    """Assemble one :class:`ManifestZoneItem` for a given Media.
+
+    Returns ``None`` if the item cannot be represented (e.g. a stream
+    row with a NULL ``stream_url``). Streams get their upstream URL
+    passed through verbatim; every other media type gets a pre-signed
+    download URL bound to the device's token.
+    """
+    if media.type == MediaType.stream:
+        if not media.stream_url:
+            return None
+        url = media.stream_url
+        md5 = ""
+        size_bytes = 0
+    else:
+        url = sign_media_url(base_url, device, media.id)  # type: ignore[arg-type]
+        md5 = media.md5_hash or ""
+        size_bytes = media.size_bytes
+
+    return ManifestZoneItem(
+        media_id=media.id,  # type: ignore[arg-type]
+        order=order,
+        type=media.type,
+        original_name=media.original_name,
+        mime_type=media.mime_type,
+        url=url,
+        md5_hash=md5,
+        size_bytes=size_bytes,
+        duration=duration_override or media.default_duration,
+    )
+
+
+def _build_zone_from_zone(
+    session: Session,
+    base_url: str,
+    device: Device,
+    zone: Zone,
+) -> ManifestZone:
+    """Materialise a real :class:`Zone` into its manifest form.
+
+    Walks the zone's items in order, resolves each ``media_id`` to a
+    :class:`Media` row, and emits a :class:`ManifestZoneItem` per
+    valid entry. Items whose media has since been deleted are
+    silently skipped — the schedule should never have referenced
+    them, but defensively handling the case keeps the manifest
+    emission robust.
+    """
+    manifest_items: list[ManifestZoneItem] = []
+    for zi in sorted(zone.items, key=lambda i: i.order):
+        media = session.get(Media, zi.media_id)
+        if not media:
+            logger.warning(
+                "Zone %s references unknown media_id=%s; skipping",
+                zone.id,
+                zi.media_id,
+            )
+            continue
+        entry = _build_zone_item(
+            base_url,
+            device,
+            media,
+            order=zi.order,
+            duration_override=zi.duration_override,
+        )
+        if entry is not None:
+            manifest_items.append(entry)
+
+    return ManifestZone(
+        zone_id=zone.id,  # type: ignore[arg-type]
+        name=zone.name,
+        position_x=zone.position_x,
+        position_y=zone.position_y,
+        width=zone.width,
+        height=zone.height,
+        z_index=zone.z_index,
+        items=manifest_items,
+    )
+
+
+def _synthetic_layout_for_media(
+    base_url: str,
+    device: Device,
+    media: Media,
+    *,
+    duration_override: int | None,
+) -> ManifestLayout | None:
+    """Wrap a legacy single-media slot in a one-zone full-screen layout.
+
+    This is the bridge that lets the player have a single uniform
+    manifest shape (a tree) even though the DB still supports the
+    pre-Phase-2 flat ``ScheduleItem → Media`` relationship. The
+    synthetic layout carries ``layout_id=None`` and a single zone
+    with ``zone_id=None`` so the worker can spot it if it ever
+    needs to (e.g. for cache keying) — but all the playback logic
+    works uniformly.
+    """
+    zone_item = _build_zone_item(
+        base_url,
+        device,
+        media,
+        order=0,
+        duration_override=duration_override,
+    )
+    if zone_item is None:
+        return None
+
+    return ManifestLayout(
+        layout_id=None,
+        name=f"Synthetic: {media.original_name}",
+        resolution_w=_SYNTHETIC_CANVAS_W,
+        resolution_h=_SYNTHETIC_CANVAS_H,
+        zones=[
+            ManifestZone(
+                zone_id=None,
+                name="Fullscreen",
+                position_x=0,
+                position_y=0,
+                width=_SYNTHETIC_CANVAS_W,
+                height=_SYNTHETIC_CANVAS_H,
+                z_index=0,
+                items=[zone_item],
+            )
+        ],
+    )
+
+
+def _effective_slide_duration(item: ScheduleItem, layout: ManifestLayout) -> int:
+    """How long a slide should stay on screen.
+
+    Priority:
+      1. ``ScheduleItem.duration_override`` if set (operator-authored).
+      2. For synthetic single-media layouts, fall back to that media's
+         own duration (the sole zone item's ``duration`` field).
+      3. Otherwise pick the max zone-item duration across all zones —
+         a layout with a 5 s text zone and a 30 s image zone should
+         stay on screen at least 30 s so every zone plays once.
+      4. Default to 10 s if the layout is empty.
+    """
+    if item.duration_override is not None and item.duration_override > 0:
+        return item.duration_override
+    all_item_durations: list[int] = []
+    for zone in layout.zones:
+        for zi in zone.items:
+            all_item_durations.append(zi.duration)
+    if all_item_durations:
+        return max(all_item_durations)
+    return 10
+
+
+@router.get("/schedule/{device_id}", response_model=LayoutManifest)
 def get_device_manifest(
     device_id: UUID,  # noqa: ARG001  # used by the auth dependency
     request: Request,
     session: Annotated[Session, Depends(get_session)],
     device: Annotated[Device, Depends(device_auth_dependency)],
-) -> PlaylistManifest:
-    """Return the JSON manifest a player should cache + download.
+) -> LayoutManifest:
+    """Return the tree-shaped manifest a player should cache + play.
 
     Requires the device's ``api_token`` (Bearer or ``X-Device-Token``).
-    Every download URL in the returned manifest is pre-signed with an
-    HMAC that binds ``device_id`` + ``media_id`` + ``exp`` to the
-    device's token; leaked URLs expire automatically and cannot be
-    replayed from a different device.
+    Shape: :class:`LayoutManifest` — a list of slides, each carrying
+    a :class:`ManifestLayout` with its :class:`ManifestZone` s and
+    their :class:`ManifestZoneItem` playlists.
+
+    Every download URL is pre-signed with an HMAC that binds
+    ``device_id`` + ``media_id`` + ``exp`` to the device's token;
+    leaked URLs expire automatically and cannot be replayed from a
+    different device. Live-stream items carry their upstream URL
+    unchanged (streams skip the download + MD5 pipeline).
+
+    Single-media legacy slots (``ScheduleItem.media_id`` set,
+    ``layout_id`` NULL) are wrapped in a synthetic full-screen one-
+    zone layout so the player has a single uniform parse path.
     """
     schedule: Schedule | None = None
-    items: list[PlaylistManifestItem] = []
+    slides: list[ManifestSlide] = []
+
     if device.current_schedule_id:
         schedule = session.get(Schedule, device.current_schedule_id)
-        if schedule:
-            base = extract_request_base_url(request)
-            for item in sorted(schedule.items, key=lambda i: i.order):
-                # Phase 2 multi-zone slots are not yet emitted in the
-                # player manifest — that's Step 4 of the sprint. For
-                # now we silently skip them so a Schedule mixing legacy
-                # media slots and Layout slots still plays the media
-                # slots correctly on players running the current code.
-                if item.media_id is None:
-                    logger.debug(
-                        "Skipping schedule item %s (layout_id=%s) in legacy manifest",
+
+    if schedule:
+        base = extract_request_base_url(request)
+        for item in sorted(schedule.items, key=lambda i: i.order):
+            manifest_layout: ManifestLayout | None
+
+            if item.layout_id is not None:
+                layout = session.get(Layout, item.layout_id)
+                if not layout:
+                    logger.warning(
+                        "ScheduleItem %s references unknown layout_id=%s; skipping",
                         item.id,
                         item.layout_id,
                     )
                     continue
-                media = session.get(Media, item.media_id)
-                if not media:
-                    continue
-                # Streams: hand the upstream URL straight to the player.
-                # No signature, no MD5, no size — they are by definition
-                # not cacheable. The player skips the cache pipeline for
-                # stream items only; the rest of the playlist is unaffected.
-                if media.type == MediaType.stream:
-                    if not media.stream_url:
-                        continue
-                    items.append(
-                        PlaylistManifestItem(
-                            media_id=media.id,  # type: ignore[arg-type]
-                            order=item.order,
-                            type=media.type,
-                            original_name=media.original_name,
-                            url=media.stream_url,
-                            md5_hash="",
-                            size_bytes=0,
-                            duration=item.duration_override or media.default_duration,
-                        )
-                    )
-                    continue
-                items.append(
-                    PlaylistManifestItem(
-                        media_id=media.id,  # type: ignore[arg-type]
-                        order=item.order,
-                        type=media.type,
-                        original_name=media.original_name,
-                        url=sign_media_url(base, device, media.id),  # type: ignore[arg-type]
-                        md5_hash=media.md5_hash or "",
-                        size_bytes=media.size_bytes,
-                        duration=item.duration_override or media.default_duration,
-                    )
+                manifest_layout = ManifestLayout(
+                    layout_id=layout.id,  # type: ignore[arg-type]
+                    name=layout.name,
+                    resolution_w=layout.resolution_w,
+                    resolution_h=layout.resolution_h,
+                    zones=[
+                        _build_zone_from_zone(session, base, device, zone)
+                        for zone in sorted(layout.zones, key=lambda z: z.z_index)
+                    ],
                 )
 
-    return PlaylistManifest(
+            elif item.media_id is not None:
+                media = session.get(Media, item.media_id)
+                if not media:
+                    logger.warning(
+                        "ScheduleItem %s references unknown media_id=%s; skipping",
+                        item.id,
+                        item.media_id,
+                    )
+                    continue
+                manifest_layout = _synthetic_layout_for_media(
+                    base,
+                    device,
+                    media,
+                    duration_override=item.duration_override,
+                )
+
+            else:
+                # Neither media_id nor layout_id set — this should have
+                # been rejected by the XOR validator in _apply_items.
+                # If it slips through, skip it rather than producing a
+                # broken slide.
+                logger.warning(
+                    "ScheduleItem %s has neither media_id nor layout_id; "
+                    "XOR validator missed this. Skipping.",
+                    item.id,
+                )
+                continue
+
+            if manifest_layout is None:
+                continue
+
+            slides.append(
+                ManifestSlide(
+                    slide_id=f"schedule_item:{item.id}",
+                    order=item.order,
+                    duration=_effective_slide_duration(item, manifest_layout),
+                    layout=manifest_layout,
+                )
+            )
+
+    return LayoutManifest(
         device_id=device.id,
         schedule_id=schedule.id if schedule else None,
         schedule_name=schedule.name if schedule else None,
         generated_at=datetime.utcnow(),
-        items=items,
+        slides=slides,
     )
