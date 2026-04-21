@@ -82,4 +82,15 @@ class Device(SQLModel, table=True):
     registered_at: datetime = Field(default_factory=datetime.utcnow)
     current_schedule_id: Optional[int] = Field(default=None, foreign_key="schedule.id")
 
+    # Per-device API token, generated at registration and persisted by the
+    # player in its local config. Rotated on demand from the CMS. Used both
+    # as a bearer credential on REST + WebSocket and as the HMAC key that
+    # signs the device's media download URLs.
+    api_token: Optional[str] = Field(
+        default=None,
+        index=True,
+        description="Long random string; opaque to the client.",
+    )
+    api_token_issued_at: Optional[datetime] = Field(default=None)
+
     schedule: Optional[Schedule] = Relationship(back_populates="devices")

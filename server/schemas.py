@@ -2,12 +2,33 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict
 
-from .models import DeviceStatus, MediaType
+from .models import Device, DeviceStatus, MediaType
+
+
+def device_to_read(device: "Device") -> "DeviceRead":
+    """Serialise a ``Device`` to ``DeviceRead`` without leaking the token.
+
+    Computes the ``has_api_token`` flag from the ORM attribute that
+    ``DeviceRead`` itself never references, so the cleartext token is
+    never reachable through the API surface accidentally.
+    """
+    return DeviceRead(
+        id=device.id,
+        name=device.name,
+        mac_address=device.mac_address,
+        hardware_id=device.hardware_id,
+        status=device.status,
+        last_ping=device.last_ping,
+        registered_at=device.registered_at,
+        current_schedule_id=device.current_schedule_id,
+        api_token_issued_at=device.api_token_issued_at,
+        has_api_token=bool(device.api_token),
+    )
 
 
 class DeviceRegisterIn(BaseModel):
@@ -17,6 +38,9 @@ class DeviceRegisterIn(BaseModel):
 
 
 class DeviceRead(BaseModel):
+    """Device info returned to admins. Never contains the ``api_token``;
+    the admin only sees whether a token is set + when it was issued."""
+
     model_config = ConfigDict(from_attributes=True)
 
     id: UUID
@@ -27,6 +51,25 @@ class DeviceRead(BaseModel):
     last_ping: Optional[datetime]
     registered_at: datetime
     current_schedule_id: Optional[int]
+    api_token_issued_at: Optional[datetime] = None
+    has_api_token: bool = False
+
+
+class DeviceCredentials(BaseModel):
+    """Extra payload returned by ``POST /api/register`` and
+    ``POST /api/devices/{id}/rotate-token``. Contains the cleartext
+    token the player must persist. Cleartext is only ever returned by
+    these two endpoints — ``GET /api/devices`` never exposes it."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    name: str
+    mac_address: str
+    hardware_id: Optional[str]
+    status: DeviceStatus
+    api_token: str
+    api_token_issued_at: Optional[datetime]
 
 
 class DeviceUpdate(BaseModel):
