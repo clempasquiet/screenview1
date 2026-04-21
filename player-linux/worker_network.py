@@ -37,7 +37,7 @@ from hardware import get_hardware_id, get_mac_address
 logger = logging.getLogger(__name__)
 
 
-WS_UNKNOWN_DEVICE_CLOSE_CODES = (4404,)
+WS_UNKNOWN_DEVICE_CLOSE_CODES = (4404, 4401)
 WS_BACKOFF_MAX = 300
 WS_BACKOFF_MIN = 5
 
@@ -110,16 +110,29 @@ class NetworkWorker(QObject):
         self.status_changed.emit("warn", f"Re-registering device: {reason}")
         self._config.device_id = None
         self._config.device_name = None
+        self._config.api_token = None
         try:
             self._config.save()
         except OSError as exc:
             logger.warning("Could not persist cleared config: %s", exc)
 
+    def _auth_headers(self) -> dict[str, str]:
+        if not self._config.api_token:
+            return {}
+        return {"Authorization": f"Bearer {self._config.api_token}"}
+
     def _ensure_registered(self) -> None:
-        if self._config.device_id:
+        if self._config.device_id and self._config.api_token:
             self.status_changed.emit("info", f"Device ID: {self._config.device_id}")
             self.registered.emit(self._config.device_id)
             return
+
+        if self._config.device_id and not self._config.api_token:
+            logger.info(
+                "Have device_id but no api_token; re-registering to acquire one."
+            )
+            self._config.device_id = None
+            self._config.device_name = None
 
         mac = get_mac_address()
         hw_id = get_hardware_id()
@@ -134,6 +147,13 @@ class NetworkWorker(QObject):
                 data = resp.json()
                 self._config.device_id = data["id"]
                 self._config.device_name = data.get("name")
+                token = data.get("api_token")
+                if not token:
+                    raise RuntimeError(
+                        "Server did not return an api_token. Upgrade the "
+                        "CMS to a build that supports per-device tokens."
+                    )
+                self._config.api_token = token
                 self._config.save()
                 self.status_changed.emit("info", f"Registered as {data['name']}")
                 self.registered.emit(self._config.device_id)
@@ -152,13 +172,14 @@ class NetworkWorker(QObject):
         try:
             resp = self._session.get(
                 f"{self._config.server_url}/api/schedule/{self._config.device_id}",
+                headers=self._auth_headers(),
                 timeout=15,
             )
         except requests.RequestException as exc:
             self.status_changed.emit("warn", f"Manifest fetch failed: {exc}")
             return
 
-        if resp.status_code in (403, 404):
+        if resp.status_code in (401, 403, 404):
             raise _StaleDeviceError(
                 f"manifest endpoint returned {resp.status_code} for "
                 f"device {self._config.device_id}"
@@ -240,9 +261,14 @@ class NetworkWorker(QObject):
     # ----- WebSocket -----------------------------------------------------
 
     def _run_ws_loop(self) -> None:
-        if not self._config.device_id:
+        if not self._config.device_id or not self._config.api_token:
             return
-        ws_url = f"{self._config.ws_url}/ws/player/{self._config.device_id}"
+        from urllib.parse import quote
+
+        ws_url = (
+            f"{self._config.ws_url}/ws/player/{self._config.device_id}"
+            f"?token={quote(self._config.api_token, safe='')}"
+        )
         backoff = WS_BACKOFF_MIN
         self._ws_requires_reregister = False
 
@@ -340,10 +366,14 @@ def _compact_ws_error(err: Exception | str) -> str:
 
 
 def _is_unknown_device_error(err: Exception | str) -> bool:
-    """Detect 'server doesn't know this device' from a WS error/close code."""
+    """Detect 'server rejected our credentials' from a WS error/close code.
+
+    Covers HTTP 403 handshake (legacy), 4404 (unknown device) and 4401
+    (bad token). All three trigger a full re-registration cycle.
+    """
     text = str(err)
     if "403" in text and "Handshake" in text:
         return True
-    if "4404" in text:
+    if "4404" in text or "4401" in text:
         return True
     return False
