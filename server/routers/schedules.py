@@ -12,6 +12,7 @@ from ..database import get_session
 from ..device_auth import (
     device_auth_dependency,
     extract_request_base_url,
+    sign_admin_preview_url,
     sign_media_url,
 )
 from ..models import Device, Media, Schedule, ScheduleItem
@@ -20,6 +21,8 @@ from ..schemas import (
     PlaylistManifestItem,
     ScheduleCreate,
     ScheduleItemIn,
+    SchedulePreview,
+    SchedulePreviewItem,
     ScheduleRead,
     ScheduleUpdate,
 )
@@ -135,6 +138,50 @@ def delete_schedule(
     session.delete(schedule)
     session.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.get(
+    "/schedules/{schedule_id}/preview",
+    response_model=SchedulePreview,
+    summary="Admin preview of a schedule (signed URLs, short TTL)",
+)
+def get_schedule_preview(
+    schedule_id: int,
+    request: Request,
+    session: Annotated[Session, Depends(get_session)],
+    _admin: Annotated[str, Depends(require_admin)],
+) -> SchedulePreview:
+    """Return the same playlist the players receive, but with
+    admin-signed preview URLs instead of per-device ones. The CMS uses
+    this to render a live preview of the schedule before publishing."""
+    schedule = session.get(Schedule, schedule_id)
+    if not schedule:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Schedule not found")
+
+    base = extract_request_base_url(request)
+    items: list[SchedulePreviewItem] = []
+    for item in sorted(schedule.items, key=lambda i: i.order):
+        media = session.get(Media, item.media_id)
+        if not media:
+            continue
+        items.append(
+            SchedulePreviewItem(
+                media_id=media.id,  # type: ignore[arg-type]
+                order=item.order,
+                type=media.type,
+                original_name=media.original_name,
+                mime_type=media.mime_type,
+                url=sign_admin_preview_url(base, media.id),  # type: ignore[arg-type]
+                duration=item.duration_override or media.default_duration,
+            )
+        )
+
+    return SchedulePreview(
+        schedule_id=schedule.id,  # type: ignore[arg-type]
+        schedule_name=schedule.name,
+        generated_at=datetime.utcnow(),
+        items=items,
+    )
 
 
 @router.post("/schedules/{schedule_id}/publish")
