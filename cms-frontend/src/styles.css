@@ -1,0 +1,104 @@
+:root {
+  --bg: #0f1115;
+  --bg-2: #161922;
+  --bg-3: #1e2230;
+  --fg: #e6e8ef;
+  --fg-dim: #9ba1b0;
+  --accent: #4f8cff;
+  --accent-2: #7aa7ff;
+  --ok: #2ecc71;
+  --warn: #f1c40f;
+  --err: #e74c3c;
+  --border: #2a2f3e;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+html, body, #app {
+  height: 100%;
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+}
+
+a { color: var(--accent-2); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+button, .btn {
+  background: var(--accent);
+  color: white;
+  border: none;
+  padding: 0.5rem 1rem;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 0.9rem;
+  font-weight: 500;
+  transition: filter 0.15s ease;
+}
+button:hover, .btn:hover { filter: brightness(1.1); }
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+.btn.secondary { background: var(--bg-3); color: var(--fg); }
+.btn.danger { background: var(--err); }
+
+input, select, textarea {
+  background: var(--bg-2);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  padding: 0.5rem 0.75rem;
+  border-radius: 6px;
+  font-size: 0.9rem;
+  width: 100%;
+}
+input:focus, select:focus, textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  background: var(--bg-2);
+  border-radius: 8px;
+  overflow: hidden;
+}
+th, td {
+  text-align: left;
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.9rem;
+}
+th { background: var(--bg-3); color: var(--fg-dim); font-weight: 600; }
+tr:last-child td { border-bottom: none; }
+
+.card {
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  padding: 1.25rem;
+  border-radius: 8px;
+}
+
+.status-pill {
+  display: inline-block;
+  padding: 0.15rem 0.6rem;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+.status-pill.active { background: rgba(46, 204, 113, 0.2); color: var(--ok); }
+.status-pill.pending { background: rgba(241, 196, 15, 0.2); color: var(--warn); }
+.status-pill.offline { background: rgba(155, 161, 176, 0.2); color: var(--fg-dim); }
+.status-pill.rejected { background: rgba(231, 76, 60, 0.2); color: var(--err); }
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 1rem;
+  gap: 1rem;
+}
+
+.muted { color: var(--fg-dim); }
+.stack > * + * { margin-top: 0.75rem; }
+.row { display: flex; gap: 0.75rem; align-items: center; }
