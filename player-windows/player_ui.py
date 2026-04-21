@@ -83,18 +83,32 @@ def _resolve_libmpv(
     """Locate libmpv-2.dll, attempting an auto-download if allowed.
 
     Returns the directory containing the DLL so the caller can prepend it
-    to PATH, or ``None`` if the DLL is unavailable.
+    to PATH, or ``None`` if the DLL is unavailable. Must never raise —
+    the player UI has to boot even if this helper explodes in a way
+    ``libmpv_fetch`` didn't anticipate.
     """
     bundled = Path(__file__).resolve().parent
-    found = ensure_libmpv(
-        bundled_dir=bundled,
-        app_data_dir=app_data_dir,
-        libmpv_dir=libmpv_dir,
-        allow_download=allow_download,
-    )
+    try:
+        found = ensure_libmpv(
+            bundled_dir=bundled,
+            app_data_dir=app_data_dir,
+            libmpv_dir=libmpv_dir,
+            allow_download=allow_download,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "libmpv resolution failed (%s: %s); continuing without video support.",
+            type(exc).__name__,
+            exc,
+        )
+        logger.debug("libmpv resolution traceback:", exc_info=True)
+        return None
     if found is None:
         return None
-    _prepend_to_path(found)
+    try:
+        _prepend_to_path(found)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not add %s to PATH: %s", found, exc)
     return found
 
 
