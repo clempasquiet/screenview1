@@ -169,24 +169,22 @@ See `player-windows/README.md` for the full kiosk lockdown checklist.
    every page as an ordinary image `Media` row. The player sees
    normal images; the rest of the pipeline (cache, MD5, signed URLs,
    preview) works unchanged.
-8. **Single-visible-surface player UI (Phase 2, Windows).** The
-   Windows player owns three full-window children — a native
-   `QWidget` for libmpv, a `QLabel` for images, a `QWebEngineView`
-   for HTML widgets + the branded placeholder — and keeps **exactly
-   one visible at any moment**. Originally Step 3 proposed a
-   permanently-layered design (mpv bottom, transparent WebEngine on
-   top) but Windows' DWM does not alpha-blend sibling HWNDs in the
-   same top-level window, so the overlay ended up clipping mpv and
-   we got audio-only playback. The revised architecture uses
-   dedicated ``_switch_to_video`` / ``_switch_to_image`` /
-   ``_switch_to_overlay`` helpers as the **only** places that toggle
-   child visibility; each `_render` branch calls exactly one. Mixing
-   content layers (e.g. an image zone over a playing video) is left
-   for a later PR that migrates mpv to
-   `QOpenGLWidget + mpv.render_api` so compositing happens inside a
-   single GL surface. See
+8. **Layered player UI via `QStackedLayout(StackAll)`.** The Windows
+   player composes two full-window children inside a
+   `QStackedLayout` configured in `StackingMode.StackAll`:
+   `_video_container` (native `QWidget` hosting libmpv) added first,
+   `_web_view` (transparent `QWebEngineView`) added second → drawn
+   on top. Both children stay visible together; the overlay's CSS
+   transparency lets mpv show through. The top-level window itself
+   is opaque black — making *it* translucent would disable the
+   HWND-level composition that the overlay relies on on Windows.
+   Non-video items (image, widget, placeholder) call
+   `_stop_video_layer()` before painting so no ghost frame bleeds
+   through the overlay's letterbox gutters. See
    `player-windows/tests/test_render_video_isolation.py` for the
-   static assertions that pin this contract.
+   static assertions that pin this contract (layer order,
+   transparency triad, overlay-stops-mpv on non-video, no manual
+   z-order mutation at runtime).
 
 ## Security model
 
