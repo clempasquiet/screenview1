@@ -161,17 +161,24 @@ See `player-windows/README.md` for the full kiosk lockdown checklist.
 
 ## Security model
 
-| Transport        | Credential                              | Behaviour on failure                  |
-|------------------|-----------------------------------------|---------------------------------------|
-| Admin REST       | JWT from `/api/auth/login`              | 401                                   |
-| Player REST      | `Authorization: Bearer <api_token>`     | 401 → player clears config, re-registers |
-| Player WebSocket | `?token=<api_token>` query parameter    | Close code 4401 → same recovery flow  |
-| Media download   | Pre-signed `?device_id&exp&sig` URL     | 403 on bad sig, 403 on expiry         |
-| Unknown device   | any                                     | 404 REST / close 4404 WS              |
+| Transport        | Credential                                                   | Behaviour on failure                     |
+|------------------|--------------------------------------------------------------|------------------------------------------|
+| Admin REST       | JWT from `/api/auth/login`                                   | 401                                      |
+| Player REST      | `Authorization: Bearer <api_token>`                          | 401 → player clears config, re-registers |
+| Player WebSocket | `?token=<api_token>` query parameter                         | Close code 4401 → same recovery flow     |
+| Player download  | Pre-signed `?device_id&exp&sig` URL                          | 403 on bad sig, 403 on expiry            |
+| Admin preview    | Pre-signed `?admin_exp&admin_sig` URL (server's secret_key)  | 403 on bad sig, 403 on expiry            |
+| Unknown device   | any                                                          | 404 REST / close 4404 WS                 |
 
 Token rotation is available from the **Devices** view in the CMS.
 Rotating a token invalidates every outstanding manifest for that device;
 the player transparently recovers on its next call.
+
+The **Live preview** in the CMS uses short-lived admin-signed download
+URLs (default TTL: 15 min) so browsers can embed media directly in
+`<img>` / `<video>` tags without attaching the admin JWT to each
+request. Rotating `SCREENVIEW_SECRET_KEY` invalidates every outstanding
+preview link.
 
 ## Synchronisation workflow
 
@@ -214,7 +221,7 @@ python -m pytest player-windows/tests
 
 - [x] Per-device API tokens (replaces UUID-as-shared-secret).
 - [x] Signed media download URLs (per-device HMAC with expiry).
-- [ ] Live preview of schedules in the CMS.
+- [x] Live preview of schedules in the CMS (admin-signed HMAC URLs).
 - [ ] PostgreSQL migration path once SQLite becomes a bottleneck.
 - [ ] HLS / RTSP live streams as an opt-in media type.
 - [ ] Per-device HTTP/S TLS certificates (mTLS) for zero-trust fleets.
