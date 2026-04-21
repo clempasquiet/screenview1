@@ -173,18 +173,31 @@ See `player-windows/README.md` for the full kiosk lockdown checklist.
    Windows player owns three full-window children — a native
    `QWidget` for libmpv, a `QLabel` for images, a `QWebEngineView`
    for HTML widgets + the branded placeholder — and keeps **exactly
-   one visible at any moment**. Originally Step 3 proposed a
-   permanently-layered design (mpv bottom, transparent WebEngine on
-   top) but Windows' DWM does not alpha-blend sibling HWNDs in the
-   same top-level window, so the overlay ended up clipping mpv and
-   we got audio-only playback. The revised architecture uses
-   dedicated ``_switch_to_video`` / ``_switch_to_image`` /
-   ``_switch_to_overlay`` helpers as the **only** places that toggle
-   child visibility; each `_render` branch calls exactly one. Mixing
-   content layers (e.g. an image zone over a playing video) is left
-   for a later PR that migrates mpv to
-   `QOpenGLWidget + mpv.render_api` so compositing happens inside a
-   single GL surface. See
+   one visible at any moment**.
+
+   The field-validated conclusion after three attempts at a truly
+   layered design (free-floating + `raise_()`, hide/show dispatch,
+   `QStackedLayout(StackAll)` with a transparent WebEngine overlay)
+   is that `QWebEngineView` on Windows creates its own native HWND
+   and Chromium's internal alpha does not compose correctly with
+   sibling HWNDs through Windows' DWM — *no* combination of
+   `WA_TranslucentBackground`, `setBackgroundColor(transparent)` and
+   layout manager variants produces a usable see-through overlay
+   above libmpv on a real kiosk. The only architectures that reliably
+   render video on Windows are (a) single-visible-surface switching
+   (what this repo does) or (b) moving mpv into a `QOpenGLWidget`
+   via `mpv.render_api` so composition happens inside a single GL
+   surface instead of across HWND boundaries. (b) is a ~500-line
+   chantier that needs a real Windows kiosk in the validation loop
+   and is deferred until a concrete use case requires overlay-on-
+   video (e.g. a clock above a playing clip). For now, multi-zone
+   layouts that mix video + other content put the video full-screen
+   and omit the rest.
+
+   Visibility transitions go through the dedicated
+   ``_switch_to_video`` / ``_switch_to_image`` / ``_switch_to_overlay``
+   helpers as the **only** places that toggle child visibility;
+   each `_render` branch calls exactly one. See
    `player-windows/tests/test_render_video_isolation.py` for the
    static assertions that pin this contract.
 
