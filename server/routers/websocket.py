@@ -39,9 +39,20 @@ async def player_ws(websocket: WebSocket, device_id: UUID) -> None:
     Protocol is deliberately trivial, JSON-over-text:
       * Player -> Server: {"type": "hello"} | {"type": "pong"} | {"type": "status", ...}
       * Server -> Player: {"action": "sync_required", ...} | {"type": "ping"}
+
+    Unknown device IDs are rejected *after* accepting the handshake and
+    closing with code 4404. Closing a WebSocket *before* ``accept()``
+    would cause Starlette to reply with HTTP 403 on the handshake, which
+    looks like a generic auth failure to older clients and doesn't carry
+    the close reason. Accepting first lets the client receive the 4404
+    code cleanly so it can drop its stale ``device_id`` and re-register.
     """
     if not _mark_device(device_id, DeviceStatus.active, touch_ping=True):
-        await websocket.close(code=4404, reason="unknown device")
+        try:
+            await websocket.accept()
+            await websocket.close(code=4404, reason="unknown device")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to signal unknown device %s: %s", device_id, exc)
         return
 
     await manager.connect(device_id, websocket)

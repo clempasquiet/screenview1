@@ -32,11 +32,14 @@ with the Linux player.
 - `libmpv-2.dll` (x64) for video playback.
   **The player fetches it automatically on first launch** when it is
   missing, dropping the DLL into `%LOCALAPPDATA%\ScreenView\libmpv\`.
+  The release archive is extracted using **`py7zr`** (pure Python,
+  pinned in `requirements.txt`) — no external 7-Zip install required.
   For airgapped kiosks, set `"libmpv_auto_download": false` in
   `config.json` and provide the DLL manually via one of:
   - Drop `libmpv-2.dll` (or `mpv-2.dll`) next to `ScreenViewPlayer.exe`
     or `main.py`.
-  - Run `.\scripts\fetch-libmpv.ps1` once during provisioning.
+  - Run `.\scripts\fetch-libmpv.ps1` once during provisioning
+    (requires 7-Zip on PATH).
   - Set `"libmpv_dir"` in `config.json` to a directory containing the DLL.
 
 ## Run from source (development)
@@ -149,6 +152,36 @@ For a truly infallible kiosk we recommend, in addition to the player:
 - Optionally enable [Assigned Access](https://learn.microsoft.com/windows/configuration/assigned-access)
   or Shell Launcher to make `ScreenViewPlayer.exe` the explicit shell.
 
+## Self-healing when the server forgets the device
+
+If the CMS database is reset, the device is deleted from the admin UI,
+or the kiosk's cached `device_id` otherwise becomes unknown to the
+server, the player detects it via two signals:
+
+- `GET /api/schedule/{device_id}` responds **404**.
+- The WebSocket connection gets closed with code **4404**
+  (`unknown device`). Older server builds that pre-date this fix
+  closed the handshake with HTTP 403; the player treats both forms as
+  "re-register" triggers.
+
+When either happens, the worker:
+
+1. Logs a single `Re-registering device: …` line (no tight loop).
+2. Clears `device_id` / `device_name` from `config.json`.
+3. POSTs `/api/register` again with the kiosk's MAC + `MachineGuid`.
+4. Resumes normal sync / WebSocket loop.
+
+The admin then sees a new **pending** device in the CMS, approves it,
+and re-assigns a schedule. No console access required on the kiosk.
+
+## WebSocket reconnect
+
+On transient network loss, the WebSocket loop uses exponential
+backoff between attempts, starting at 5 s and capped at 5 min. Each
+successful connection resets the delay. Identical consecutive error
+messages are logged only once instead of spamming the file every
+few seconds.
+
 ## Troubleshooting
 
 - **"Content unavailable" placeholder on video items:** `libmpv-2.dll`
@@ -174,6 +207,11 @@ For a truly infallible kiosk we recommend, in addition to the player:
   boots (images and widgets work); fetch the DLL manually using
   `fetch-libmpv.ps1` from a machine with Internet access and copy it
   into the install dir, or set `"libmpv_dir"` to a UNC path.
+- **Repeated WebSocket 403 / 4404 in the log:** the server doesn't
+  know this device. Normally self-healed by automatic re-registration;
+  if it persists, delete `%LOCALAPPDATA%\ScreenView\config.json` and
+  restart the player, or confirm the CMS hasn't filtered out the
+  device MAC.
 
 ## Tests
 

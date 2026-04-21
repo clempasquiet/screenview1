@@ -105,10 +105,12 @@ try {
 
     if (-not $extracted) {
         throw @"
-Could not extract the .7z archive. Install one of:
-  * 7-Zip (https://www.7-zip.org/) — recommended
-  * Or upgrade to Windows 10 1803+ where tar.exe ships with libarchive 7z support
-Then re-run this script.
+Could not extract the .7z archive with any external tool.
+Install 7-Zip from https://www.7-zip.org/ (recommended) and re-run this
+script. Alternatively, the Python player itself ships a pure-Python
+extractor (py7zr) that avoids this problem entirely — run
+`python main.py` once with an internet connection to have the player
+self-provision libmpv-2.dll under %LOCALAPPDATA%\ScreenView\libmpv\.
 "@
     }
 

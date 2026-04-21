@@ -207,7 +207,20 @@ def _download_libmpv(target_dir: Path, variant: str = "x86_64") -> Optional[Path
 
 
 def _extract_archive(archive: Path, dest: Path) -> bool:
-    """Try known Windows extractors in order. Returns True on success."""
+    """Extract *archive* into *dest*. Returns True on success.
+
+    Tries, in order:
+      1. ``py7zr`` — pure-Python 7z library. Always works when the package
+         is installed (listed in requirements.txt).
+      2. External ``7z.exe`` / ``7zr.exe`` — honours any pre-existing
+         7-Zip install.
+      3. ``tar.exe`` (bsdtar with libarchive) on Windows 10 1803+. Note
+         that some Windows builds ship a libarchive without 7z support,
+         so this is genuinely a last-resort fallback.
+    """
+    if _extract_with_py7zr(archive, dest):
+        return True
+
     commands = _extractor_commands(archive, dest)
     for cmd in commands:
         try:
@@ -230,9 +243,25 @@ def _extract_archive(archive: Path, dest: Path) -> bool:
             (result.stderr or b"").decode("utf-8", errors="replace").strip(),
         )
     logger.warning(
-        "No working archive extractor found. Install 7-Zip or update Windows to 10 1803+."
+        "No working 7z extractor found. Install py7zr (pip install py7zr) "
+        "or 7-Zip, or run scripts/fetch-libmpv.ps1 from a machine that has one."
     )
     return False
+
+
+def _extract_with_py7zr(archive: Path, dest: Path) -> bool:
+    try:
+        import py7zr  # type: ignore[import-not-found]
+    except ImportError:
+        logger.debug("py7zr not available; falling back to external extractors.")
+        return False
+    try:
+        with py7zr.SevenZipFile(str(archive), mode="r") as zf:
+            zf.extractall(path=str(dest))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("py7zr extraction failed: %s", exc)
+        return False
+    return True
 
 
 def _extractor_commands(archive: Path, dest: Path) -> list[list[str]]:

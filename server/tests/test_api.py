@@ -106,3 +106,25 @@ def test_media_and_schedule_manifest(client: TestClient) -> None:
     assert len(data["items"]) == 1
     assert data["items"][0]["duration"] == 7
     assert data["items"][0]["md5_hash"] == media["md5_hash"]
+
+
+def test_manifest_unknown_device_returns_404(client: TestClient) -> None:
+    """Players detect a stale device_id by looking for a 404 here."""
+    bogus = "00000000-0000-0000-0000-000000000000"
+    resp = client.get(f"/api/schedule/{bogus}")
+    assert resp.status_code == 404
+
+
+def test_websocket_unknown_device_closes_with_4404(client: TestClient) -> None:
+    """The WS endpoint must accept the handshake then close with 4404
+    (rather than rejecting the handshake with HTTP 403), so clients can
+    reliably distinguish 'unknown device' from a generic auth failure
+    behind a reverse proxy.
+    """
+    bogus = "00000000-0000-0000-0000-000000000000"
+    with client.websocket_connect(f"/ws/player/{bogus}") as ws:
+        with pytest.raises(Exception) as excinfo:  # noqa: PT011
+            ws.receive_text()
+        # starlette.websockets.WebSocketDisconnect surfaces the code here.
+        code = getattr(excinfo.value, "code", None)
+        assert code == 4404, f"Expected close code 4404, got {code!r}"
