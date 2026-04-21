@@ -33,18 +33,49 @@ router = APIRouter(prefix="/api", tags=["schedules"])
 
 
 def _apply_items(session: Session, schedule: Schedule, items: list[ScheduleItemIn]) -> None:
-    for existing in list(schedule.items):
-        session.delete(existing)
-    session.flush()
+    """Replace a schedule's items in place, driven by the ORM relationship.
+
+    We mutate ``schedule.items`` **through the relationship** rather than
+    issuing explicit ``session.delete()`` calls on the existing rows.
+    The relationship is declared with ``cascade='all, delete-orphan'``
+    so clearing the list and appending fresh ``ScheduleItem`` rows causes
+    SQLAlchemy to emit the necessary DELETEs for the orphaned items at
+    flush time.
+
+    The previous implementation deleted items manually then flushed,
+    which left ``schedule.items`` populated with deleted-but-still-in-
+    memory objects. The next ``session.add(schedule)`` (e.g. from
+    ``update_schedule`` when it refreshes ``updated_at``) then walked
+    the relationship via the cascade and raised:
+
+        Instance '<ScheduleItem …>' has been deleted. Use the
+        make_transient() function to send this object back to the
+        transient state.
+
+    The test suite never caught it because every test that exercised
+    ``_apply_items`` did so on a freshly-created empty schedule, so the
+    loop that deletes existing items was a no-op. Doing a ``PATCH`` on
+    a schedule that already had items triggered the bug on every run.
+    """
+    # Validate every incoming media_id up-front. We want a 400 response
+    # with the bad id identified, not a partial mutation + 500.
     for item in items:
         media = session.get(Media, item.media_id)
         if not media:
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST, detail=f"Media {item.media_id} not found"
             )
-        session.add(
+
+    # Drop every existing ScheduleItem via the relationship. The
+    # delete-orphan cascade takes care of the DELETEs at flush time.
+    schedule.items.clear()
+    session.flush()
+
+    # Now attach the new items via the relationship. SQLAlchemy fills
+    # in ``schedule_id`` automatically from the relationship back-ref.
+    for item in items:
+        schedule.items.append(
             ScheduleItem(
-                schedule_id=schedule.id,  # type: ignore[arg-type]
                 media_id=item.media_id,
                 order=item.order,
                 duration_override=item.duration_override,
