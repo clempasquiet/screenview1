@@ -7,12 +7,19 @@
           {{ creatingStream ? 'Adding…' : '+ Add stream' }}
         </button>
         <label class="btn">
-          <input type="file" hidden @change="onFileChosen" :disabled="uploading" />
+          <input
+            type="file"
+            hidden
+            accept="image/*,video/*,.pdf,application/pdf"
+            @change="onFileChosen"
+            :disabled="uploading"
+          />
           {{ uploading ? 'Uploading…' : 'Upload file' }}
         </label>
       </div>
     </div>
     <p v-if="error" class="error">{{ error }}</p>
+    <p v-if="flash" class="flash">{{ flash }}</p>
     <table>
       <thead>
         <tr>
@@ -120,6 +127,7 @@ import PreviewPlayer from '../components/PreviewPlayer.vue'
 
 const items = ref([])
 const error = ref(null)
+const flash = ref('')
 const uploading = ref(false)
 // Cached short-lived admin thumbnail URLs keyed by media id.
 const thumbs = reactive({})
@@ -165,14 +173,37 @@ async function refresh() {
   }
 }
 
+function isPdf(file) {
+  // PyMuPDF + the server-side sniff both actually parse the file, so
+  // a wrong MIME is caught server-side. Here we only decide which
+  // endpoint to call.
+  if (file.type === 'application/pdf') return true
+  if (file.name && file.name.toLowerCase().endsWith('.pdf')) return true
+  return false
+}
+
 async function onFileChosen(event) {
   const file = event.target.files?.[0]
   event.target.value = ''
   if (!file) return
   uploading.value = true
   error.value = null
+  flash.value = ''
   try {
-    await api.uploadMedia(file, 10)
+    if (isPdf(file)) {
+      // PDFs are flattened server-side into one image Media per page.
+      const result = await api.uploadPdf(file, { default_duration: 10 })
+      const total = result.pages.length
+      const dedup = result.pages_deduplicated
+      const added = result.pages_added
+      flash.value =
+        dedup > 0
+          ? `Imported ${total} page(s) from ${file.name}: ${added} new, ${dedup} already in the library.`
+          : `Imported ${total} page(s) from ${file.name}.`
+      setTimeout(() => { flash.value = '' }, 6000)
+    } else {
+      await api.uploadMedia(file, 10)
+    }
     await refresh()
   } catch (e) {
     error.value = e.message
@@ -293,6 +324,7 @@ onMounted(refresh)
 .type-icon { font-size: 1.5rem; color: var(--fg-dim); }
 .mono { font-family: monospace; }
 .error { color: var(--err); }
+.flash { color: var(--ok); }
 .actions { display: flex; gap: 0.5rem; flex-wrap: wrap; }
 .stream-url {
   display: inline-block;

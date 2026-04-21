@@ -114,6 +114,21 @@ class StreamCreate(BaseModel):
     mime_type: Optional[str] = None  # optional hint for the player
 
 
+class PdfIngestResult(BaseModel):
+    """Result of ``POST /api/media/pdf``.
+
+    A single PDF upload produces N ordered image pages on the server.
+    Each page is an ordinary ``MediaType.image`` row the admin can
+    drop into playlists or Zone items like any other image. The CMS
+    can use ``pages_added`` / ``pages_deduplicated`` to tell the
+    operator "you uploaded 7 pages, 2 were already in the library".
+    """
+
+    pages_added: int
+    pages_deduplicated: int
+    pages: list[MediaRead]  # every page, in order (new + dedup'd)
+
+
 class ScheduleItemIn(BaseModel):
     """Payload for creating / updating a single slot in a Schedule.
 
