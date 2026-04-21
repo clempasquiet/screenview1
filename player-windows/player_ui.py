@@ -379,32 +379,26 @@ class PlayerWindow(QWidget):
             return
         self._show_placeholder("Content unavailable")
 
-    def _release_web_view(self) -> None:
-        """Free the WebEngine's DOM + JS heap for the previous page.
-
-        Called whenever we leave a ``widget`` item so a 24/7 kiosk
-        cycling through HTML overlays doesn't let the last page's
-        JavaScript timers, event listeners or cached images keep
-        growing the resident set. Loading ``about:blank`` is the
-        cheapest way to tell Chromium "forget everything you know".
-        We also flush the in-memory HTTP cache on the same profile
-        so repeatedly-loaded data URLs / 304 responses do not
-        accumulate forever.
-        """
-        if self._web_view is None:
-            return
-        try:
-            self._web_view.stop()
-            self._web_view.setUrl(QUrl("about:blank"))
-            profile = self._web_view.page().profile()
-            profile.clearHttpCache()
-            # Purge any cycles Chromium left dangling across C++/Python.
-            # Cheap (microseconds) and compounds across thousands of swaps.
-            gc.collect()
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("Web view release failed: %s", exc)
-
     def _render(self, entry: PlaylistEntry) -> None:
+        # NB: we intentionally do NOT touch ``self._web_view`` from the
+        # non-widget branches below. On Windows, QWebEngineView carries
+        # its own native HWND (Chromium composites on a dedicated OS
+        # window). Any mutation of that view — even one as benign as
+        # ``setUrl("about:blank")`` — wakes up the Chromium compositor
+        # and can re-raise the web-view HWND above the libmpv
+        # container's HWND in the native z-order. The symptom is a
+        # playing video whose audio is heard but whose picture is
+        # hidden by a transparent Chromium surface on top.
+        #
+        # Memory hygiene is still handled, just elsewhere:
+        #   * The profile is configured with MemoryHttpCache and
+        #     NoPersistentCookies at construction time (see __init__),
+        #     so there is no disk growth.
+        #   * The in-memory cache + cookies are wiped right BEFORE
+        #     each new widget load (below).
+        #   * A full teardown happens in closeEvent.
+        # Net effect: the bounded-RSS goal is preserved while video
+        # rendering stays untouched.
         path = entry.path
         if entry.kind == "image":
             pix = QPixmap(str(path))
@@ -417,8 +411,6 @@ class PlayerWindow(QWidget):
             )
             self._image_label.setPixmap(scaled)
             self._stack.setCurrentWidget(self._image_label)
-            # Leaving a widget for an image / video: blank the web view.
-            self._release_web_view()
             return
 
         if entry.kind == "video":
@@ -430,7 +422,6 @@ class PlayerWindow(QWidget):
             self._stack.setCurrentWidget(self._video_container)
             self._mpv.loadfile(str(path), mode="replace")
             self._mpv.pause = False
-            self._release_web_view()
             return
 
         if entry.kind == "stream":
@@ -448,7 +439,6 @@ class PlayerWindow(QWidget):
             # item rather than freeze the screen.
             self._mpv.loadfile(entry.stream_url, mode="replace")
             self._mpv.pause = False
-            self._release_web_view()
             return
 
         if entry.kind == "widget":
