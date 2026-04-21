@@ -80,6 +80,8 @@ def main() -> int:
             fullscreen=config.fullscreen,
             show_cursor=config.show_cursor,
             libmpv_dir=config.libmpv_dir,
+            libmpv_app_data_dir=config.app_data_dir,
+            libmpv_auto_download=config.libmpv_auto_download,
         )
 
         thread, worker = start_in_thread(config)

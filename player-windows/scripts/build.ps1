@@ -29,6 +29,17 @@ try {
     & $venvPython -m pip install -r requirements.txt
     & $venvPython -m pip install pyinstaller
 
+    # Ensure libmpv-2.dll is next to the spec so PyInstaller bundles it.
+    $dllNames = @("libmpv-2.dll", "mpv-2.dll")
+    $dllPresent = $false
+    foreach ($name in $dllNames) {
+        if (Test-Path -LiteralPath $name) { $dllPresent = $true; break }
+    }
+    if (-not $dllPresent) {
+        Write-Host "libmpv-2.dll missing; fetching it…"
+        & (Join-Path $PSScriptRoot "fetch-libmpv.ps1")
+    }
+
     & $venvPython -m PyInstaller ScreenViewPlayer.spec --clean --noconfirm
     Write-Host "Build complete. Output in .\dist\ScreenViewPlayer.exe"
 }

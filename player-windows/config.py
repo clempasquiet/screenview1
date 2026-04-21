@@ -41,6 +41,7 @@ class PlayerConfig:
     show_cursor: bool = False
     prevent_display_sleep: bool = True
     libmpv_dir: Optional[str] = None
+    libmpv_auto_download: bool = True
 
     @classmethod
     def load(cls, path: Path | None = None) -> "PlayerConfig":
@@ -74,6 +75,18 @@ class PlayerConfig:
             base = APP_DATA_DIR / "cache"
         base.mkdir(parents=True, exist_ok=True)
         return base
+
+    @property
+    def libmpv_cache_dir(self) -> Path:
+        """Writable directory for auto-downloaded ``libmpv-2.dll`` copies."""
+        base = APP_DATA_DIR / "libmpv"
+        base.mkdir(parents=True, exist_ok=True)
+        return base
+
+    @property
+    def app_data_dir(self) -> Path:
+        APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
+        return APP_DATA_DIR
 
     @property
     def log_path(self) -> Path:

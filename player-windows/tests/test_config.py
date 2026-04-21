@@ -28,6 +28,26 @@ def test_config_seeds_from_bundled_file_on_first_run(tmp_path, monkeypatch):
     data = json.loads(target.read_text(encoding="utf-8"))
     assert data["server_url"].startswith("http")
     assert cfg.fullscreen is True
+    assert cfg.libmpv_auto_download is True
+
+
+def test_config_ignores_unknown_fields(tmp_path):
+    # Forward-compatible: an older binary reading a newer config.json must
+    # not crash on unknown keys.
+    target = tmp_path / "config.json"
+    target.write_text(
+        json.dumps(
+            {
+                "server_url": "http://example.org",
+                "some_future_flag": True,
+                "libmpv_auto_download": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    cfg = PlayerConfig.load(target)
+    assert cfg.server_url == "http://example.org"
+    assert cfg.libmpv_auto_download is False
 
 
 def test_config_roundtrip(tmp_path):
