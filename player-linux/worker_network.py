@@ -25,7 +25,7 @@ import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import requests
 import websocket  # type: ignore[import-untyped]
@@ -44,13 +44,24 @@ WS_BACKOFF_MIN = 5
 
 @dataclass
 class PlaylistEntry:
-    """Resolved playlist item pointing at a locally cached file."""
+    """Resolved playlist item.
+
+    For ``kind in {'video', 'image', 'widget'}`` ``path`` points at a
+    locally cached, MD5-validated file. For ``kind == 'stream'`` there
+    is no local copy: ``path`` is ``None`` and ``stream_url`` carries
+    the upstream URL that ``libmpv`` will open directly.
+    """
 
     media_id: int
-    kind: str  # 'video' | 'image' | 'widget'
-    path: Path
+    kind: str  # 'video' | 'image' | 'widget' | 'stream'
+    path: Optional[Path]
     duration: int
     original_name: str
+    stream_url: Optional[str] = None
+
+    @property
+    def is_stream(self) -> bool:
+        return self.kind == "stream"
 
 
 class _StaleDeviceError(RuntimeError):
@@ -202,6 +213,32 @@ class NetworkWorker(QObject):
         resolved: list[PlaylistEntry] = []
         total = len(items)
         for idx, item in enumerate(items):
+            kind = item.get("type")
+            # Live streams skip the cache + MD5 pipeline entirely; the
+            # URL is opened directly by libmpv at play time. They are
+            # the documented exception to the offline-first guarantee:
+            # if the network is down at play time the player just shows
+            # the placeholder for that item and moves on.
+            if kind == "stream":
+                stream_url = item.get("url")
+                if not stream_url:
+                    self.status_changed.emit(
+                        "warn", f"Stream item missing URL: {item.get('original_name')}"
+                    )
+                    continue
+                resolved.append(
+                    PlaylistEntry(
+                        media_id=item["media_id"],
+                        kind="stream",
+                        path=None,
+                        duration=int(item.get("duration") or 30),
+                        original_name=item.get("original_name") or "Live stream",
+                        stream_url=stream_url,
+                    )
+                )
+                self.sync_progress.emit(idx + 1, total)
+                continue
+
             try:
                 local_path = self._ensure_cached(item)
             except Exception as exc:  # noqa: BLE001
@@ -215,7 +252,7 @@ class NetworkWorker(QObject):
             resolved.append(
                 PlaylistEntry(
                     media_id=item["media_id"],
-                    kind=item["type"],
+                    kind=kind,
                     path=local_path,
                     duration=int(item.get("duration") or 10),
                     original_name=item.get("original_name") or local_path.name,
@@ -223,7 +260,8 @@ class NetworkWorker(QObject):
             )
             self.sync_progress.emit(idx + 1, total)
 
-        self._cleanup_cache(keep={e.path.name for e in resolved})
+        # Stream entries have no on-disk file; only keep file-backed names.
+        self._cleanup_cache(keep={e.path.name for e in resolved if e.path is not None})
         self.status_changed.emit("info", "Sync complete — swapping playlist.")
         self.playlist_ready.emit(resolved)
 

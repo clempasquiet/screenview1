@@ -82,13 +82,15 @@ class MediaRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
-    filename: str
+    # Nullable for streams (no local file, no MD5).
+    filename: Optional[str] = None
     original_name: str
     type: MediaType
-    md5_hash: str
-    size_bytes: int
+    md5_hash: Optional[str] = None
+    size_bytes: int = 0
     default_duration: int
     mime_type: Optional[str]
+    stream_url: Optional[str] = None
     created_at: datetime
 
 
@@ -96,6 +98,20 @@ class MediaUpdate(BaseModel):
     original_name: Optional[str] = None
     default_duration: Optional[int] = None
     type: Optional[MediaType] = None
+    stream_url: Optional[str] = None
+
+
+class StreamCreate(BaseModel):
+    """Payload for ``POST /api/media/stream``.
+
+    Streams have no associated upload; they're a thin wrapper around a
+    user-supplied URL that the player hands directly to libmpv.
+    """
+
+    name: str
+    url: str
+    default_duration: int = 30  # how long to keep the stream on screen
+    mime_type: Optional[str] = None  # optional hint for the player
 
 
 class ScheduleItemIn(BaseModel):
@@ -137,15 +153,21 @@ class ScheduleRead(BaseModel):
 
 
 class PlaylistManifestItem(BaseModel):
-    """Single item returned in the sync manifest downloaded by the player."""
+    """Single item returned in the sync manifest downloaded by the player.
+
+    For ``MediaType.stream`` items, ``url`` holds the upstream live-stream
+    URL (HLS / RTSP / RTMP / SRT) and ``md5_hash`` / ``size_bytes`` are 0
+    / empty — the player skips the cache pipeline entirely and hands the
+    URL straight to libmpv.
+    """
 
     media_id: int
     order: int
     type: MediaType
     original_name: str
     url: str
-    md5_hash: str
-    size_bytes: int
+    md5_hash: str = ""  # empty for streams
+    size_bytes: int = 0  # 0 for streams
     duration: int
 
 

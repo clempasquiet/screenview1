@@ -29,17 +29,33 @@ class MediaType(str, Enum):
     video = "video"
     image = "image"
     widget = "widget"
+    # Live network stream (HLS .m3u8, RTSP, RTMP, SRT, etc). Unlike the
+    # other types, ``stream`` items are NOT cached locally — the player
+    # hands the URL to libmpv directly. They break the offline-first
+    # guarantee for themselves only; the rest of the playlist still
+    # plays from the validated cache.
+    stream = "stream"
 
 
 class Media(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
-    filename: str  # path on disk, relative to upload_dir
+    # ``filename`` and ``md5_hash`` are NULL for streams since there's no
+    # local file. Uploaded files always populate both. The migration in
+    # ``database.py`` relaxes the NOT NULL constraints in place for
+    # SQLite databases that pre-date this change.
+    filename: Optional[str] = None  # path on disk, relative to upload_dir
     original_name: str
     type: MediaType = Field(default=MediaType.image)
-    md5_hash: str = Field(index=True)
+    md5_hash: Optional[str] = Field(default=None, index=True)
     size_bytes: int = 0
     default_duration: int = Field(default=10, description="Default play duration in seconds")
     mime_type: Optional[str] = None
+    # For ``MediaType.stream``: the upstream URL (HLS, RTSP, RTMP, SRT).
+    # Players pass it straight to libmpv. Validated server-side for an
+    # allow-list of schemes so the CMS can't be tricked into pointing
+    # players at e.g. file:// URLs that would resolve on the player's
+    # local filesystem.
+    stream_url: Optional[str] = Field(default=None)
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
     items: list["ScheduleItem"] = Relationship(back_populates="media")

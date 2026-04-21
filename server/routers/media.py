@@ -22,9 +22,9 @@ from ..device_auth import (
     verify_media_signature,
 )
 from ..models import Device, Media, MediaType, ScheduleItem
-from ..schemas import MediaPreviewUrl, MediaRead, MediaUpdate
+from ..schemas import MediaPreviewUrl, MediaRead, MediaUpdate, StreamCreate
 from ..security import require_admin
-from ..utils import guess_media_type, md5_of_file
+from ..utils import guess_media_type, md5_of_file, validate_stream_url
 
 router = APIRouter(prefix="/api/media", tags=["media"])
 
@@ -81,6 +81,58 @@ async def upload_media(
     return media
 
 
+@router.post(
+    "/stream",
+    response_model=MediaRead,
+    status_code=status.HTTP_201_CREATED,
+    summary="Register a live stream as a Media item (no upload)",
+)
+def create_stream_media(
+    payload: StreamCreate,
+    session: Annotated[Session, Depends(get_session)],
+    _admin: Annotated[str, Depends(require_admin)],
+) -> Media:
+    """Live streams are a thin wrapper around a user-supplied URL.
+
+    They break the offline-first guarantee for themselves only — the
+    player skips the local-cache + MD5 pipeline and hands the URL
+    straight to libmpv. The rest of the playlist is unaffected.
+
+    Stream URLs are validated against an allow-list of schemes
+    (``http``/``https``/``rtsp``/``rtsps``/``rtmp``/``rtmps``/``srt``/
+    ``udp``/``rtp``) so the CMS can't accidentally instruct players to
+    open ``file://`` URLs that would resolve on the kiosk's own
+    filesystem.
+    """
+    try:
+        stream_url = validate_stream_url(payload.url)
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+    if payload.default_duration <= 0:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail="default_duration must be a positive integer (seconds).",
+        )
+
+    name = payload.name.strip() or "Live stream"
+
+    media = Media(
+        filename=None,
+        original_name=name,
+        type=MediaType.stream,
+        md5_hash=None,
+        size_bytes=0,
+        default_duration=payload.default_duration,
+        mime_type=payload.mime_type,
+        stream_url=stream_url,
+    )
+    session.add(media)
+    session.commit()
+    session.refresh(media)
+    return media
+
+
 @router.get("/{media_id}", response_model=MediaRead)
 def get_media(
     media_id: int,
@@ -103,7 +155,15 @@ def update_media(
     media = session.get(Media, media_id)
     if not media:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Media not found")
-    for key, value in payload.model_dump(exclude_unset=True).items():
+
+    data = payload.model_dump(exclude_unset=True)
+    if "stream_url" in data and data["stream_url"]:
+        try:
+            data["stream_url"] = validate_stream_url(data["stream_url"])
+        except ValueError as exc:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+    for key, value in data.items():
         setattr(media, key, value)
     session.add(media)
     session.commit()
@@ -134,8 +194,10 @@ def delete_media(
             detail="Media is used by at least one schedule; remove it from schedules first.",
         )
 
-    path = settings.upload_dir / media.filename
-    path.unlink(missing_ok=True)
+    # Streams have no on-disk artifact; only file-backed media need an unlink.
+    if media.filename:
+        path = settings.upload_dir / media.filename
+        path.unlink(missing_ok=True)
     session.delete(media)
     session.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
@@ -185,6 +247,12 @@ def download_media(
             detail="Missing signed URL parameters",
         )
 
+    if media.type == MediaType.stream or not media.filename:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This media has no downloadable file (live stream).",
+        )
+
     path = settings.upload_dir / media.filename
     if not path.exists():
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="File missing on disk")
@@ -214,6 +282,25 @@ def make_preview_url(
     media = session.get(Media, media_id)
     if not media:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Media not found")
+
+    # Streams don't go through our download endpoint at all — the
+    # CMS preview hands the upstream URL straight to <video>/<iframe>
+    # like the player would. No signing needed because the URL is
+    # already public-by-construction.
+    if media.type == MediaType.stream:
+        if not media.stream_url:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST, detail="Stream has no URL set."
+            )
+        return MediaPreviewUrl(
+            media_id=media_id,
+            url=media.stream_url,
+            mime_type=media.mime_type,
+            type=media.type,
+            original_name=media.original_name,
+            default_duration=media.default_duration,
+        )
+
     base = extract_request_base_url(request)
     return MediaPreviewUrl(
         media_id=media_id,

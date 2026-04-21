@@ -63,6 +63,12 @@ export const api = {
     fd.append('default_duration', String(default_duration))
     return request('/api/media', { method: 'POST', body: fd })
   },
+  createStreamMedia({ name, url, default_duration = 30, mime_type = null }) {
+    return request('/api/media/stream', {
+      method: 'POST',
+      body: JSON.stringify({ name, url, default_duration, mime_type }),
+    })
+  },
   updateMedia(id, patch) {
     return request(`/api/media/${id}`, { method: 'PATCH', body: JSON.stringify(patch) })
   },

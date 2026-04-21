@@ -37,6 +37,32 @@
           @ended="advance"
           @error="handleMediaError"
         />
+        <video
+          v-else-if="current.type === 'stream' && isBrowserPlayableStream(current.url)"
+          ref="videoEl"
+          :src="current.url"
+          class="stage-media"
+          autoplay
+          muted
+          playsinline
+          @ended="advance"
+          @error="handleMediaError"
+        />
+        <div
+          v-else-if="current.type === 'stream'"
+          class="stage-placeholder stream-note"
+        >
+          <strong>Live stream preview unavailable in the browser.</strong>
+          <p>
+            <code>{{ current.url }}</code>
+          </p>
+          <p class="muted">
+            Browsers cannot play RTSP / RTMP / SRT directly. The kiosk player
+            (libmpv) handles them natively. Open the URL in VLC for a quick
+            sanity check, or schedule it on a player to verify it on the actual
+            display.
+          </p>
+        </div>
         <iframe
           v-else
           :src="current.url"
@@ -54,7 +80,7 @@
             <span v-if="current" class="muted">· {{ current.original_name }}</span>
             <span v-if="current" class="muted">· {{ current.duration }}s</span>
           </div>
-          <div class="progress-bar" v-if="current && current.type !== 'video'">
+          <div class="progress-bar" v-if="current && needsTimer(current)">
             <div class="progress-bar-fill" :style="{ width: progressPct + '%' }"></div>
           </div>
         </div>
@@ -108,9 +134,32 @@ function stopTimer() {
   }
 }
 
+function isBrowserPlayableStream(url) {
+  if (!url) return false
+  // Browsers can natively play HLS in most cases (Safari directly, others
+  // when the server serves the right MIME). RTSP/RTMP/SRT need libmpv.
+  const u = url.toLowerCase()
+  if (u.startsWith('http://') || u.startsWith('https://')) return true
+  return false
+}
+
+function needsTimer(item) {
+  if (!item) return false
+  if (item.type === 'image' || item.type === 'widget') return true
+  if (item.type === 'stream') {
+    // The note panel and any non-browser-playable stream rely on the timer.
+    // For browser-playable HLS we still drive auto-advance via the duration
+    // timer because a live stream has no natural ``ended`` event.
+    return true
+  }
+  return false
+}
+
 function startTimer() {
   stopTimer()
-  if (!current.value || current.value.type === 'video') return
+  // Recorded videos rely on the native ``ended`` event; everything else
+  // (images, widgets, live streams of any flavour) is timer-driven.
+  if (!current.value || !needsTimer(current.value)) return
   lastTick = performance.now()
   const loop = (t) => {
     if (paused.value) {
@@ -131,7 +180,7 @@ function startTimer() {
 }
 
 const progressPct = computed(() => {
-  if (!current.value || current.value.type === 'video') return 0
+  if (!current.value || !needsTimer(current.value)) return 0
   const total = Math.max(1, current.value.duration * 1000)
   return Math.min(100, (elapsedMs.value / total) * 100)
 })
@@ -298,8 +347,19 @@ onBeforeUnmount(() => {
 .stage-placeholder {
   color: var(--fg-dim);
   font-size: 0.95rem;
+  text-align: center;
+  padding: 1.5rem;
+  max-width: 720px;
 }
 .stage-placeholder.error { color: var(--err); }
+.stream-note p { margin: 0.5rem 0; }
+.stream-note code {
+  background: var(--bg-3);
+  color: var(--fg);
+  padding: 0.15rem 0.4rem;
+  border-radius: 4px;
+  word-break: break-all;
+}
 
 .preview-footer {
   display: grid;

@@ -139,11 +139,16 @@ See `player-windows/README.md` for the full kiosk lockdown checklist.
 
 1. **Store & Forward.** The player never renders a file streamed from the
    network. Media is downloaded, MD5-verified, then played from disk.
+   *Exception:* `MediaType.stream` items (HLS / RTSP / RTMP / SRT) are by
+   definition not cacheable. They break this rule **for themselves only**;
+   the rest of the playlist still plays from the validated cache, and a
+   stream item that fails to play is skipped without affecting the rest.
 2. **Separation of channels.** WebSocket carries light signals (`ping`,
    `sync_required`). REST carries heavy payloads (manifest JSON + file
    downloads).
 3. **Offline-first.** If the server is unreachable the player loops its
-   last cached playlist forever; reconnection is fully idempotent.
+   last cached playlist forever; reconnection is fully idempotent. Live
+   streams are the documented exception per principle 1.
 4. **Strict thread separation on the player.** The `QThread` worker owns
    all I/O; the UI thread only renders. They communicate through PyQt
    signals — see `player-linux/worker_network.py` and
@@ -201,7 +206,10 @@ Defined in `server/models.py` (SQLModel):
 
 - **Device** — registered player, status, assigned schedule, last ping,
   per-device `api_token` (rotated at registration and from the CMS).
-- **Media** — uploaded file (video/image/widget) with MD5 + default duration.
+- **Media** — either an uploaded file
+  (`video`/`image`/`widget`, with `filename` + `md5_hash`) or a live
+  `stream` item (with `stream_url` instead of file/MD5). The `Media` row
+  carries both shapes; the `type` discriminates.
 - **Schedule** — named playlist referenced by one or more devices.
 - **ScheduleItem** — ordered join row allowing per-item duration overrides.
 
@@ -222,8 +230,8 @@ python -m pytest player-windows/tests
 - [x] Per-device API tokens (replaces UUID-as-shared-secret).
 - [x] Signed media download URLs (per-device HMAC with expiry).
 - [x] Live preview of schedules in the CMS (admin-signed HMAC URLs).
+- [x] HLS / RTSP / RTMP / SRT live streams as an opt-in media type.
 - [ ] PostgreSQL migration path once SQLite becomes a bottleneck.
-- [ ] HLS / RTSP live streams as an opt-in media type.
 - [ ] Per-device HTTP/S TLS certificates (mTLS) for zero-trust fleets.
 - [ ] Scheduled content (day-parting) instead of a single active playlist per device.
 
