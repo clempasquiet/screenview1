@@ -169,22 +169,37 @@ See `player-windows/README.md` for the full kiosk lockdown checklist.
    every page as an ordinary image `Media` row. The player sees
    normal images; the rest of the pipeline (cache, MD5, signed URLs,
    preview) works unchanged.
-8. **Layered player UI via `QStackedLayout(StackAll)`.** The Windows
-   player composes two full-window children inside a
-   `QStackedLayout` configured in `StackingMode.StackAll`:
-   `_video_container` (native `QWidget` hosting libmpv) added first,
-   `_web_view` (transparent `QWebEngineView`) added second → drawn
-   on top. Both children stay visible together; the overlay's CSS
-   transparency lets mpv show through. The top-level window itself
-   is opaque black — making *it* translucent would disable the
-   HWND-level composition that the overlay relies on on Windows.
-   Non-video items (image, widget, placeholder) call
-   `_stop_video_layer()` before painting so no ghost frame bleeds
-   through the overlay's letterbox gutters. See
+8. **Single-visible-surface player UI (Phase 2, Windows).** The
+   Windows player owns three full-window children — a native
+   `QWidget` for libmpv, a `QLabel` for images, a `QWebEngineView`
+   for HTML widgets + the branded placeholder — and keeps **exactly
+   one visible at any moment**.
+
+   The field-validated conclusion after three attempts at a truly
+   layered design (free-floating + `raise_()`, hide/show dispatch,
+   `QStackedLayout(StackAll)` with a transparent WebEngine overlay)
+   is that `QWebEngineView` on Windows creates its own native HWND
+   and Chromium's internal alpha does not compose correctly with
+   sibling HWNDs through Windows' DWM — *no* combination of
+   `WA_TranslucentBackground`, `setBackgroundColor(transparent)` and
+   layout manager variants produces a usable see-through overlay
+   above libmpv on a real kiosk. The only architectures that reliably
+   render video on Windows are (a) single-visible-surface switching
+   (what this repo does) or (b) moving mpv into a `QOpenGLWidget`
+   via `mpv.render_api` so composition happens inside a single GL
+   surface instead of across HWND boundaries. (b) is a ~500-line
+   chantier that needs a real Windows kiosk in the validation loop
+   and is deferred until a concrete use case requires overlay-on-
+   video (e.g. a clock above a playing clip). For now, multi-zone
+   layouts that mix video + other content put the video full-screen
+   and omit the rest.
+
+   Visibility transitions go through the dedicated
+   ``_switch_to_video`` / ``_switch_to_image`` / ``_switch_to_overlay``
+   helpers as the **only** places that toggle child visibility;
+   each `_render` branch calls exactly one. See
    `player-windows/tests/test_render_video_isolation.py` for the
-   static assertions that pin this contract (layer order,
-   transparency triad, overlay-stops-mpv on non-video, no manual
-   z-order mutation at runtime).
+   static assertions that pin this contract.
 
 ## Security model
 
