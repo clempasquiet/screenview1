@@ -211,7 +211,19 @@ Defined in `server/models.py` (SQLModel):
   `stream` item (with `stream_url` instead of file/MD5). The `Media` row
   carries both shapes; the `type` discriminates.
 - **Schedule** — named playlist referenced by one or more devices.
-- **ScheduleItem** — ordered join row allowing per-item duration overrides.
+- **ScheduleItem** — ordered playlist slot. Exactly one of
+  `media_id` (legacy single-media slot) or `layout_id` (Phase 2
+  multi-zone slot) is set per row. The XOR is enforced by the
+  schedules router; the database has no CHECK constraint because
+  SQLite can't add one retroactively.
+- **Layout** — a fixed-resolution canvas (e.g. 1920×1080) composed of
+  one or more **Zones**. A Layout is what's shown during a single
+  `ScheduleItem` play-slot when the slot's `layout_id` is set.
+- **Zone** — a rectangular region inside a Layout with an absolute
+  `(position_x, position_y, width, height)` and a `z_index`. Each
+  Zone has its own ordered playlist.
+- **ZoneItem** — ordered Media playlist entry within a Zone
+  (`zone_id` / `media_id` / `order` / `duration_override`).
 
 ## Tests
 
