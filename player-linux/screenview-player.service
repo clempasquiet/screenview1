@@ -1,0 +1,19 @@
+[Unit]
+Description=ScreenView digital signage player
+After=network-online.target graphical.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=signage
+Environment=DISPLAY=:0
+Environment=QT_QPA_PLATFORM=xcb
+WorkingDirectory=/opt/screenview/player-linux
+ExecStart=/opt/screenview/player-linux/.venv/bin/python main.py
+Restart=always
+RestartSec=3
+StandardOutput=append:/var/log/screenview-player.log
+StandardError=append:/var/log/screenview-player.log
+
+[Install]
+WantedBy=graphical.target
