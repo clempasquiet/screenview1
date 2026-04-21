@@ -22,7 +22,18 @@ from ..device_auth import (
     verify_media_signature,
 )
 from ..models import Device, Media, MediaType, ScheduleItem
-from ..schemas import MediaPreviewUrl, MediaRead, MediaUpdate, StreamCreate
+from .. import pdf as pdf_mod  # exposes MAX_PAGES etc as module attrs
+from ..pdf import (
+    DEFAULT_DPI,
+    MAX_DPI,
+    MIN_DPI,
+    EncryptedPdfError,
+    InvalidPdfError,
+    PdfTooLargeError,
+    looks_like_pdf,
+    render_pdf_to_jpegs,
+)
+from ..schemas import MediaPreviewUrl, MediaRead, MediaUpdate, PdfIngestResult, StreamCreate
 from ..security import require_admin
 from ..utils import guess_media_type, md5_of_file, validate_stream_url
 
@@ -131,6 +142,165 @@ def create_stream_media(
     session.commit()
     session.refresh(media)
     return media
+
+
+@router.post(
+    "/pdf",
+    response_model=PdfIngestResult,
+    status_code=status.HTTP_201_CREATED,
+    summary="Upload a PDF; server flattens it to one image Media per page",
+)
+async def upload_pdf(
+    session: Annotated[Session, Depends(get_session)],
+    _admin: Annotated[str, Depends(require_admin)],
+    file: UploadFile = File(...),
+    default_duration: int = Form(10),
+    dpi: int = Form(DEFAULT_DPI),
+) -> PdfIngestResult:
+    """Render a PDF server-side into one JPEG per page.
+
+    Each page becomes an ordinary ``MediaType.image`` row with the
+    normal MD5 hash, signed download URLs, and dedup — so the rest of
+    the Store-and-Forward pipeline (player cache, schedules, preview)
+    treats them as any other image. **Players never parse PDF**; this
+    endpoint is what upholds that rule.
+
+    Rendering
+
+      * Uses PyMuPDF at ``dpi`` (default 150, clamped to 72–300).
+      * Output is baseline JPEG at quality 85 (see ``server/pdf.py``).
+      * Caps single uploads at ``pdf.MAX_PAGES`` (100 by default) to
+        prevent a runaway upload from saturating disk + the worker
+        thread.
+
+    Transactional guarantees
+
+      * If anything in the rendering step fails (malformed PDF, one
+        bad page), **nothing** is persisted — no files on disk, no
+        rows in the DB, and the caller gets a 400 with a specific
+        error.
+      * Individual pages are deduplicated by MD5. Re-uploading the
+        same PDF returns the existing Media rows instead of
+        duplicating the library. The response separates
+        ``pages_added`` from ``pages_deduplicated`` so the CMS can
+        show an accurate summary.
+    """
+    if dpi < MIN_DPI or dpi > MAX_DPI:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail=f"dpi must be between {MIN_DPI} and {MAX_DPI} (got {dpi}).",
+        )
+    if default_duration <= 0:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail="default_duration must be a positive integer (seconds).",
+        )
+    if not file.filename:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="Missing filename.")
+
+    pdf_bytes = await file.read()
+    if not pdf_bytes:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="Empty upload.")
+    if not looks_like_pdf(pdf_bytes):
+        # Cheap sniff before we spin up a MuPDF parser. The player
+        # also catches this but the friendly 400 here is what the
+        # CMS shows the operator.
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail="File is not a PDF (missing %PDF- header).",
+        )
+
+    # Render first, commit to the DB second. The renderer already
+    # rolls back partial pages on its own failure, and we roll the
+    # directory back ourselves below if the DB insert throws.
+    try:
+        # Dereference ``MAX_PAGES`` via the module each call so tests
+        # can monkey-patch ``server.pdf.MAX_PAGES`` and hit the
+        # oversized-PDF branch without a server restart.
+        rendered = render_pdf_to_jpegs(
+            pdf_bytes,
+            settings.upload_dir,
+            dpi=dpi,
+            max_pages=pdf_mod.MAX_PAGES,
+        )
+    except (InvalidPdfError, EncryptedPdfError) as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    except PdfTooLargeError as exc:
+        raise HTTPException(
+            status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail=str(exc)
+        ) from exc
+    except Exception as exc:  # noqa: BLE001 — genuine catch-all for the renderer
+        raise HTTPException(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"PDF rendering failed: {exc}",
+        ) from exc
+
+    ordered_media: list[Media] = []
+    added = 0
+    deduplicated = 0
+
+    try:
+        for page in rendered:
+            abs_path = settings.upload_dir / page.filename
+            page_md5 = md5_of_file(abs_path)
+
+            # Dedup: same bytes already in the library → drop this
+            # copy and reuse the existing row. Re-uploading an
+            # identical brochure converges to the same Media ids.
+            existing = session.exec(
+                select(Media).where(Media.md5_hash == page_md5)
+            ).first()
+            if existing:
+                abs_path.unlink(missing_ok=True)
+                ordered_media.append(existing)
+                deduplicated += 1
+                continue
+
+            media = Media(
+                filename=page.filename,
+                original_name=f"{file.filename} — {page.human_label}",
+                type=MediaType.image,
+                md5_hash=page_md5,
+                size_bytes=page.size_bytes,
+                default_duration=default_duration,
+                mime_type="image/jpeg",
+            )
+            session.add(media)
+            session.flush()  # get the PK before we move on
+            ordered_media.append(media)
+            added += 1
+
+        session.commit()
+    except Exception as exc:
+        # Something blew up mid-ingest. Unlink every page we wrote
+        # for THIS upload (the ones we reused from the library stay
+        # put — they pre-existed) so a retry doesn't see orphan
+        # files. ``session.rollback`` clears any pending INSERTs from
+        # the transaction. We convert to HTTPException(500) rather
+        # than letting the original exception propagate so clients
+        # (and the Starlette TestClient) see a proper JSON error
+        # response instead of a raw traceback.
+        for page in rendered:
+            (settings.upload_dir / page.filename).unlink(missing_ok=True)
+        try:
+            session.rollback()
+        except Exception:  # noqa: BLE001  — best-effort; we're already unwinding
+            pass
+        raise HTTPException(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"PDF ingest failed while persisting Media rows: {exc}",
+        ) from exc
+
+    # Refresh in one pass so ``MediaRead`` serialisation picks up
+    # autogenerated ids + timestamps.
+    for m in ordered_media:
+        session.refresh(m)
+
+    return PdfIngestResult(
+        pages_added=added,
+        pages_deduplicated=deduplicated,
+        pages=[MediaRead.model_validate(m, from_attributes=True) for m in ordered_media],
+    )
 
 
 @router.get("/{media_id}", response_model=MediaRead)
