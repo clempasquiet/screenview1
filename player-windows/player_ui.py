@@ -21,6 +21,7 @@ Failure handling:
 """
 from __future__ import annotations
 
+import gc
 import logging
 import os
 import sys
@@ -39,10 +40,12 @@ from PyQt6.QtWidgets import (
 
 try:
     from PyQt6.QtWebEngineWidgets import QWebEngineView  # type: ignore[import-not-found]
+    from PyQt6.QtWebEngineCore import QWebEngineProfile  # type: ignore[import-not-found]
 
     HAS_WEBENGINE = True
 except Exception:  # noqa: BLE001
     HAS_WEBENGINE = False
+    QWebEngineProfile = None  # type: ignore[assignment]
 
 from libmpv_fetch import ensure_libmpv
 from worker_network import PlaylistEntry
@@ -176,6 +179,19 @@ class PlayerWindow(QWidget):
 
         if HAS_WEBENGINE:
             self._web_view = QWebEngineView()
+            # Cap the WebEngine disk cache so a 24/7 kiosk loading many
+            # widget pages cannot grow it unbounded. The in-memory
+            # cache is cleared on every media switch; the disk cache is
+            # cleared on window close.
+            try:
+                profile = self._web_view.page().profile()
+                profile.setHttpCacheType(QWebEngineProfile.HttpCacheType.MemoryHttpCache)
+                profile.setPersistentCookiesPolicy(
+                    QWebEngineProfile.PersistentCookiesPolicy.NoPersistentCookies
+                )
+                profile.setHttpCacheMaximumSize(50 * 1024 * 1024)  # 50 MiB
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Could not tune QWebEngineProfile: %s", exc)
             self._stack.addWidget(self._web_view)
         else:
             self._web_view = None
@@ -363,6 +379,31 @@ class PlayerWindow(QWidget):
             return
         self._show_placeholder("Content unavailable")
 
+    def _release_web_view(self) -> None:
+        """Free the WebEngine's DOM + JS heap for the previous page.
+
+        Called whenever we leave a ``widget`` item so a 24/7 kiosk
+        cycling through HTML overlays doesn't let the last page's
+        JavaScript timers, event listeners or cached images keep
+        growing the resident set. Loading ``about:blank`` is the
+        cheapest way to tell Chromium "forget everything you know".
+        We also flush the in-memory HTTP cache on the same profile
+        so repeatedly-loaded data URLs / 304 responses do not
+        accumulate forever.
+        """
+        if self._web_view is None:
+            return
+        try:
+            self._web_view.stop()
+            self._web_view.setUrl(QUrl("about:blank"))
+            profile = self._web_view.page().profile()
+            profile.clearHttpCache()
+            # Purge any cycles Chromium left dangling across C++/Python.
+            # Cheap (microseconds) and compounds across thousands of swaps.
+            gc.collect()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Web view release failed: %s", exc)
+
     def _render(self, entry: PlaylistEntry) -> None:
         path = entry.path
         if entry.kind == "image":
@@ -376,6 +417,8 @@ class PlayerWindow(QWidget):
             )
             self._image_label.setPixmap(scaled)
             self._stack.setCurrentWidget(self._image_label)
+            # Leaving a widget for an image / video: blank the web view.
+            self._release_web_view()
             return
 
         if entry.kind == "video":
@@ -387,6 +430,7 @@ class PlayerWindow(QWidget):
             self._stack.setCurrentWidget(self._video_container)
             self._mpv.loadfile(str(path), mode="replace")
             self._mpv.pause = False
+            self._release_web_view()
             return
 
         if entry.kind == "stream":
@@ -404,11 +448,22 @@ class PlayerWindow(QWidget):
             # item rather than freeze the screen.
             self._mpv.loadfile(entry.stream_url, mode="replace")
             self._mpv.pause = False
+            self._release_web_view()
             return
 
         if entry.kind == "widget":
             if self._web_view is None:
                 raise RuntimeError("QWebEngineView not available")
+            # Clear the in-memory cache + cookies of the *previous*
+            # widget page before loading the next one. On long-running
+            # kiosks this is the difference between a bounded RSS and
+            # an OOM after a few days of HTML rotation.
+            try:
+                profile = self._web_view.page().profile()
+                profile.clearHttpCache()
+                profile.cookieStore().deleteAllCookies()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Pre-load WebEngine cleanup failed: %s", exc)
             self._web_view.load(QUrl.fromLocalFile(str(path)))
             self._stack.setCurrentWidget(self._web_view)
             return
@@ -436,11 +491,36 @@ class PlayerWindow(QWidget):
             QTimer.singleShot(0, self._advance)
 
     def closeEvent(self, event) -> None:  # noqa: N802
+        # Tear down libmpv first — blocks a few hundred ms on decoder
+        # shutdown, which must happen before we release the WebEngine
+        # or Qt's display server resources.
         if self._mpv is not None:
             try:
                 self._mpv.terminate()
             except Exception:  # noqa: BLE001
                 pass
+            self._mpv = None
+
+        # Drain the WebEngine profile and schedule the view for deletion
+        # via the Qt event loop (``deleteLater``). On a 24/7 kiosk that
+        # has been swapping HTML pages for days this is the hook that
+        # actually frees the persistent bits Chromium keeps around.
+        if self._web_view is not None:
+            try:
+                profile = self._web_view.page().profile()
+                profile.clearHttpCache()
+                profile.clearAllVisitedLinks()
+                profile.cookieStore().deleteAllCookies()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("WebEngine final cleanup failed: %s", exc)
+            try:
+                self._web_view.setUrl(QUrl("about:blank"))
+                self._web_view.deleteLater()
+            except Exception:  # noqa: BLE001
+                pass
+            self._web_view = None
+            gc.collect()
+
         super().closeEvent(event)
 
 
