@@ -26,6 +26,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import random
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -35,10 +36,15 @@ import requests
 import websocket  # type: ignore[import-untyped]
 from PyQt6.QtCore import QObject, QThread, pyqtSignal
 
-from config import PlayerConfig
+from config import APP_DIR, PlayerConfig
 from hardware import get_hardware_id, get_mac_address
 
 logger = logging.getLogger(__name__)
+
+# Exported so downstream helpers (e.g. future ``mpv.conf`` or script
+# lookups) can reach the application's install directory without
+# relying on ``os.getcwd()`` — Task Scheduler sets CWD to System32.
+_ = APP_DIR  # re-export for modules that import it from here
 
 # Close codes that the server emits when a device is unknown. See
 # server/routers/websocket.py (``close(code=4404)``) and the
@@ -49,14 +55,18 @@ logger = logging.getLogger(__name__)
 # emits 4404 for an unknown device_id and 4401 for a rejected token.
 WS_UNKNOWN_DEVICE_CLOSE_CODES = (4404, 4401)
 
-# Upper bound for the WebSocket reconnect backoff, in seconds. Prevents
-# the player from spamming the server (and the log file) when the
-# network is unreachable or the server keeps closing the handshake.
-WS_BACKOFF_MAX = 300
-
-# Minimum backoff. Starts here and doubles on every failure until
-# WS_BACKOFF_MAX, reset on every successful connection.
-WS_BACKOFF_MIN = 5
+# Exponential backoff for the WebSocket reconnect loop, in seconds.
+# Schedule: 2 → 4 → 8 → 16 → 30 (capped). Each failure doubles the
+# previous delay up to ``WS_BACKOFF_MAX``. A successful ``on_open``
+# resets the backoff back to ``WS_BACKOFF_MIN``.
+#
+# A cheap ±20% jitter (``WS_BACKOFF_JITTER``) is layered on top so a
+# fleet of players coming back online at the same time (after a power
+# cut, for example) doesn't all reconnect on the exact same beat and
+# hammer the server's accept loop.
+WS_BACKOFF_MIN = 2
+WS_BACKOFF_MAX = 30
+WS_BACKOFF_JITTER = 0.2  # fraction of the nominal delay
 
 
 @dataclass
@@ -423,9 +433,19 @@ class NetworkWorker(QObject):
 
             if not self._running:
                 return
-            # Exponential backoff, capped. Reset to WS_BACKOFF_MIN on successful
-            # open (see on_open).
-            time.sleep(min(backoff, WS_BACKOFF_MAX))
+            # Capped exponential backoff with ±20% jitter. The nominal
+            # schedule is 2 → 4 → 8 → 16 → 30 seconds. ``on_open``
+            # resets ``backoff`` back to WS_BACKOFF_MIN so a momentary
+            # blip doesn't promote the delay to its cap permanently.
+            nominal = min(backoff, WS_BACKOFF_MAX)
+            jittered = _jittered_delay(nominal, WS_BACKOFF_JITTER)
+            logger.debug(
+                "WS reconnect in %.1fs (nominal %ds, next nominal %ds)",
+                jittered,
+                nominal,
+                min(backoff * 2, WS_BACKOFF_MAX),
+            )
+            time.sleep(jittered)
             backoff = min(backoff * 2, WS_BACKOFF_MAX)
 
 
@@ -447,6 +467,20 @@ def _md5(path: Path) -> str:
                 break
             md5.update(chunk)
     return md5.hexdigest()
+
+
+def _jittered_delay(nominal_seconds: float, jitter_fraction: float) -> float:
+    """Return *nominal_seconds* perturbed by ±*jitter_fraction*.
+
+    Uses ``random.uniform`` so a fleet of players reconnecting after a
+    common outage doesn't synchronise on the exact same instants.
+    Clamped to a minimum of 0.1 s so ``time.sleep()`` never returns
+    immediately with a negative input. Non-random-critical use;
+    ``random`` is fine here.
+    """
+    jitter = nominal_seconds * jitter_fraction
+    delay = nominal_seconds + random.uniform(-jitter, jitter)  # noqa: S311
+    return max(0.1, delay)
 
 
 def _compact_ws_error(err: Exception | str) -> str:
