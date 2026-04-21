@@ -16,6 +16,15 @@ from typing import Optional
 APP_NAME = "ScreenView"
 
 
+# Directory containing this source file. Anchoring every relative path to
+# this location (instead of ``os.getcwd()``) is what keeps the player
+# working under Task Scheduler — Windows launches scheduled tasks with
+# CWD=``C:\Windows\System32`` by default, which would otherwise send
+# every ``Path("cache")`` / ``Path("mpv")`` lookup into the system
+# directory.
+APP_DIR = Path(__file__).resolve().parent
+
+
 def _default_app_data_dir() -> Path:
     """Return `%LOCALAPPDATA%\\ScreenView` on Windows, a home-dir fallback elsewhere."""
     local = os.environ.get("LOCALAPPDATA")
@@ -26,7 +35,24 @@ def _default_app_data_dir() -> Path:
 
 APP_DATA_DIR = _default_app_data_dir()
 DEFAULT_CONFIG_PATH = APP_DATA_DIR / "config.json"
-BUNDLED_CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
+BUNDLED_CONFIG_PATH = APP_DIR / "config.json"
+
+
+def resolve_app_path(value: str | os.PathLike[str] | None) -> Path | None:
+    """Resolve a user-supplied path relative to the *application* directory.
+
+    Absolute paths pass through unchanged. Relative paths are anchored to
+    :data:`APP_DIR` so the player behaves identically whether it was
+    launched from its install directory, from a scheduled task with a
+    different CWD, or via ``python -m player-windows``.
+    Returns ``None`` if the input is falsy.
+    """
+    if not value:
+        return None
+    p = Path(value)
+    if p.is_absolute():
+        return p
+    return (APP_DIR / p).resolve()
 
 
 @dataclass
@@ -74,10 +100,11 @@ class PlayerConfig:
 
     @property
     def cache_path(self) -> Path:
-        if self.cache_dir:
-            base = Path(self.cache_dir)
-        else:
-            base = APP_DATA_DIR / "cache"
+        # Relative ``cache_dir`` values (e.g. "cache", "./media") are
+        # anchored to APP_DIR rather than os.getcwd() so a scheduled
+        # task launched from C:\Windows\System32 still finds its cache.
+        resolved = resolve_app_path(self.cache_dir)
+        base = resolved if resolved is not None else APP_DATA_DIR / "cache"
         base.mkdir(parents=True, exist_ok=True)
         return base
 
@@ -89,9 +116,23 @@ class PlayerConfig:
         return base
 
     @property
+    def libmpv_search_dir(self) -> Path | None:
+        """Resolved :data:`libmpv_dir` or ``None``. Relative values are
+        resolved against the application directory so operators can set
+        ``"libmpv_dir": "mpv"`` without tying the install to a CWD."""
+        return resolve_app_path(self.libmpv_dir)
+
+    @property
     def app_data_dir(self) -> Path:
         APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
         return APP_DATA_DIR
+
+    @property
+    def app_dir(self) -> Path:
+        """Directory of the running application (co-located with main.py /
+        the packaged exe). Never changes at runtime; safe for DLL / config
+        lookups independent of the current CWD."""
+        return APP_DIR
 
     @property
     def log_path(self) -> Path:
