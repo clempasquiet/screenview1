@@ -15,7 +15,7 @@ from ..device_auth import (
     sign_admin_preview_url,
     sign_media_url,
 )
-from ..models import Device, Media, Schedule, ScheduleItem
+from ..models import Device, Media, MediaType, Schedule, ScheduleItem
 from ..schemas import (
     PlaylistManifest,
     PlaylistManifestItem,
@@ -164,6 +164,14 @@ def get_schedule_preview(
         media = session.get(Media, item.media_id)
         if not media:
             continue
+        # Streams skip the signed-URL pipeline entirely — the player
+        # (and the CMS preview) hands the upstream URL straight to mpv.
+        if media.type == MediaType.stream:
+            if not media.stream_url:
+                continue
+            url = media.stream_url
+        else:
+            url = sign_admin_preview_url(base, media.id)  # type: ignore[arg-type]
         items.append(
             SchedulePreviewItem(
                 media_id=media.id,  # type: ignore[arg-type]
@@ -171,7 +179,7 @@ def get_schedule_preview(
                 type=media.type,
                 original_name=media.original_name,
                 mime_type=media.mime_type,
-                url=sign_admin_preview_url(base, media.id),  # type: ignore[arg-type]
+                url=url,
                 duration=item.duration_override or media.default_duration,
             )
         )
@@ -230,6 +238,26 @@ def get_device_manifest(
                 media = session.get(Media, item.media_id)
                 if not media:
                     continue
+                # Streams: hand the upstream URL straight to the player.
+                # No signature, no MD5, no size — they are by definition
+                # not cacheable. The player skips the cache pipeline for
+                # stream items only; the rest of the playlist is unaffected.
+                if media.type == MediaType.stream:
+                    if not media.stream_url:
+                        continue
+                    items.append(
+                        PlaylistManifestItem(
+                            media_id=media.id,  # type: ignore[arg-type]
+                            order=item.order,
+                            type=media.type,
+                            original_name=media.original_name,
+                            url=media.stream_url,
+                            md5_hash="",
+                            size_bytes=0,
+                            duration=item.duration_override or media.default_duration,
+                        )
+                    )
+                    continue
                 items.append(
                     PlaylistManifestItem(
                         media_id=media.id,  # type: ignore[arg-type]
@@ -237,7 +265,7 @@ def get_device_manifest(
                         type=media.type,
                         original_name=media.original_name,
                         url=sign_media_url(base, device, media.id),  # type: ignore[arg-type]
-                        md5_hash=media.md5_hash,
+                        md5_hash=media.md5_hash or "",
                         size_bytes=media.size_bytes,
                         duration=item.duration_override or media.default_duration,
                     )
