@@ -80,4 +80,10 @@ export const api = {
   publishSchedule(id) {
     return request(`/api/schedules/${id}/publish`, { method: 'POST' })
   },
+  previewSchedule(id) {
+    return request(`/api/schedules/${id}/preview`)
+  },
+  previewMediaUrl(id) {
+    return request(`/api/media/${id}/preview-url`, { method: 'POST' })
+  },
 }
