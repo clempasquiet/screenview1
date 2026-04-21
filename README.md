@@ -197,9 +197,25 @@ See `player-windows/README.md` for the full kiosk lockdown checklist.
    Visibility transitions go through the dedicated
    ``_switch_to_video`` / ``_switch_to_image`` / ``_switch_to_overlay``
    helpers as the **only** places that toggle child visibility;
-   each `_render` branch calls exactly one. See
+   each `_render_slide` branch calls exactly one. See
    `player-windows/tests/test_render_video_isolation.py` for the
    static assertions that pin this contract.
+9. **Layout-tree manifest.** The player consumes a tree-shaped
+   manifest (`server/schemas.py :: LayoutManifest`) whose leaves
+   are `Slide → Layout → Zone → ZoneItem`. Each slide has a
+   server-computed global `duration` that drives the player's
+   transition timer — per-item timings only matter within a zone's
+   internal rotation. Legacy single-media `ScheduleItem` rows
+   (those with `media_id` set, `layout_id` NULL) are wrapped
+   server-side in a **synthetic** one-zone full-screen layout
+   (`layout_id=None`, `zone_id=None`), so the worker and UI have a
+   single uniform parse path. Slide dispatch on the player:
+
+   | Slide shape                                              | Render path                                                   |
+   |---------------------------------------------------------|---------------------------------------------------------------|
+   | Any video or stream item in any zone                     | `_switch_to_video` + mpv, video full-screen, other zones dropped with a warning (principle 8 trade-off) |
+   | Single zone, single image, full-canvas                   | `_switch_to_image` + `QLabel.setPixmap` fast path             |
+   | Any other HTML-only shape (images, widgets, text, mixed) | `_switch_to_overlay` + multi-zone absolute-positioned HTML    |
 
 ## Security model
 
@@ -283,6 +299,13 @@ python -m pytest player-windows/tests
 - [x] Signed media download URLs (per-device HMAC with expiry).
 - [x] Live preview of schedules in the CMS (admin-signed HMAC URLs).
 - [x] HLS / RTSP / RTMP / SRT live streams as an opt-in media type.
+- [x] Multi-zone / canvas layouts (Phase 2): Layout / Zone / ZoneItem
+  models, admin CRUD in the CMS, Layout-tree manifest consumed by
+  the Windows player, HTML overlay for multi-zone HTML-only slides,
+  and the documented video-full-screen trade-off for mixed slides.
+- [ ] `mpv.render_api` + `QOpenGLWidget` so multi-zone slides can
+  mix video and other content without the principle-8 trade-off
+  (blocker: needs a real Windows kiosk in the validation loop).
 - [ ] PostgreSQL migration path once SQLite becomes a bottleneck.
 - [ ] Per-device HTTP/S TLS certificates (mTLS) for zero-trust fleets.
 - [ ] Scheduled content (day-parting) instead of a single active playlist per device.
