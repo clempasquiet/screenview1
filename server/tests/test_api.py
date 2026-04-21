@@ -315,6 +315,164 @@ def test_websocket_accepts_correct_token(client: TestClient) -> None:
         ws.send_json({"type": "status"})
 
 
+def test_preview_url_requires_admin(client: TestClient) -> None:
+    """POST /api/media/{id}/preview-url and GET /api/schedules/{id}/preview
+    must be admin-only."""
+    headers = _admin_auth(client)
+    up = client.post(
+        "/api/media",
+        headers=headers,
+        files={"file": ("preview.png", b"preview-bytes", "image/png")},
+        data={"default_duration": "5"},
+    )
+    media_id = up.json()["id"]
+
+    # Unauthenticated request → 401.
+    anon = client.post(f"/api/media/{media_id}/preview-url")
+    assert anon.status_code == 401
+
+
+def test_admin_preview_url_streams_media(client: TestClient) -> None:
+    """The admin-signed URL must serve the file without any Auth header
+    (that's the whole point — browsers can embed it in <img>/<video>)."""
+    headers = _admin_auth(client)
+    payload = b"preview-bytes"
+    up = client.post(
+        "/api/media",
+        headers=headers,
+        files={"file": ("preview.png", payload, "image/png")},
+        data={"default_duration": "5"},
+    )
+    media_id = up.json()["id"]
+
+    signed = client.post(f"/api/media/{media_id}/preview-url", headers=headers).json()
+    assert "admin_exp=" in signed["url"]
+    assert "admin_sig=" in signed["url"]
+    # The device-signed params are NOT in an admin URL, so an attacker
+    # who only has this link can't replay it as a device download.
+    assert "device_id=" not in signed["url"]
+
+    resp = client.get(signed["url"])
+    assert resp.status_code == 200
+    assert resp.content == payload
+
+
+def test_admin_preview_url_rejects_forged_signature(client: TestClient) -> None:
+    headers = _admin_auth(client)
+    up = client.post(
+        "/api/media",
+        headers=headers,
+        files={"file": ("preview2.png", b"x", "image/png")},
+        data={"default_duration": "5"},
+    )
+    media_id = up.json()["id"]
+
+    exp = int(time.time()) + 300
+    resp = client.get(
+        f"/api/media/{media_id}/download",
+        params={"admin_exp": exp, "admin_sig": "forged"},
+    )
+    assert resp.status_code == 403
+
+
+def test_admin_preview_url_rejects_after_expiry(client: TestClient) -> None:
+    headers = _admin_auth(client)
+    up = client.post(
+        "/api/media",
+        headers=headers,
+        files={"file": ("preview3.png", b"x", "image/png")},
+        data={"default_duration": "5"},
+    )
+    media_id = up.json()["id"]
+
+    # Compute a valid signature for an already-expired timestamp.
+    exp = int(time.time()) - 10
+    secret_key = "change-me-in-production"  # matches default for the test settings
+    payload = f"{media_id}|{exp}".encode("utf-8")
+    import base64
+
+    sig = (
+        base64.urlsafe_b64encode(
+            hmac.new(secret_key.encode("utf-8"), payload, sha256).digest()
+        )
+        .rstrip(b"=")
+        .decode("ascii")
+    )
+    resp = client.get(
+        f"/api/media/{media_id}/download",
+        params={"admin_exp": exp, "admin_sig": sig},
+    )
+    assert resp.status_code == 403
+
+
+def test_schedule_preview_returns_admin_signed_items(client: TestClient) -> None:
+    headers = _admin_auth(client)
+
+    up = client.post(
+        "/api/media",
+        headers=headers,
+        files={"file": ("item.png", b"hello", "image/png")},
+        data={"default_duration": "3"},
+    )
+    media_id = up.json()["id"]
+
+    sched = client.post(
+        "/api/schedules",
+        headers=headers,
+        json={
+            "name": "PreviewMe",
+            "items": [{"media_id": media_id, "order": 0, "duration_override": 4}],
+        },
+    )
+    schedule_id = sched.json()["id"]
+
+    # Unauthenticated → 401.
+    anon = client.get(f"/api/schedules/{schedule_id}/preview")
+    assert anon.status_code == 401
+
+    # Admin → full preview.
+    resp = client.get(f"/api/schedules/{schedule_id}/preview", headers=headers)
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["schedule_id"] == schedule_id
+    assert data["schedule_name"] == "PreviewMe"
+    assert len(data["items"]) == 1
+    item = data["items"][0]
+    assert item["duration"] == 4
+    assert item["type"] == "image"
+    assert "admin_exp=" in item["url"]
+    assert "admin_sig=" in item["url"]
+
+    # Each URL streams without auth.
+    dl = client.get(item["url"])
+    assert dl.status_code == 200
+    assert dl.content == b"hello"
+
+
+def test_device_download_still_rejects_admin_shaped_params(client: TestClient) -> None:
+    """Passing admin_exp/admin_sig on a route that only has a device
+    signature must not short-circuit the device check — and vice versa."""
+    headers = _admin_auth(client)
+    up = client.post(
+        "/api/media",
+        headers=headers,
+        files={"file": ("guard.png", b"guard", "image/png")},
+        data={"default_duration": "3"},
+    )
+    media_id = up.json()["id"]
+
+    # No signature at all → 401.
+    resp = client.get(f"/api/media/{media_id}/download")
+    assert resp.status_code == 401
+
+    # Partial device params (missing sig) → still 401.
+    resp = client.get(
+        f"/api/media/{media_id}/download",
+        params={"device_id": "00000000-0000-0000-0000-000000000000", "exp": 999},
+    )
+    assert resp.status_code == 401
+
+
 def test_websocket_unknown_device_closes_with_4404(client: TestClient) -> None:
     """Unknown device_id still returns the dedicated 4404 code so the
     player can distinguish "I don't exist" from "my token is wrong"."""

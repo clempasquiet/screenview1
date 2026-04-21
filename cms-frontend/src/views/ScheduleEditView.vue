@@ -8,12 +8,25 @@
         </h2>
       </div>
       <div class="row">
+        <button class="btn secondary" @click="openPreview" :disabled="previewLoading">
+          {{ previewLoading ? 'Loading…' : '▶ Preview' }}
+        </button>
         <button class="btn secondary" @click="publish">Publish to devices</button>
         <button class="btn" @click="saveAll">Save</button>
       </div>
     </div>
     <p v-if="error" class="error">{{ error }}</p>
     <p v-if="flash" class="flash">{{ flash }}</p>
+
+    <PreviewPlayer
+      :open="previewOpen"
+      :title="previewTitle"
+      :subtitle="previewSubtitle"
+      :items="previewItems"
+      :loading="previewLoading"
+      :error="previewError"
+      @close="previewOpen = false"
+    />
 
     <div class="grid">
       <section class="card">
@@ -62,12 +75,21 @@
 import { computed, onMounted, ref } from 'vue'
 import { useRoute, RouterLink } from 'vue-router'
 import { api } from '../api'
+import PreviewPlayer from '../components/PreviewPlayer.vue'
 
 const route = useRoute()
 const schedule = ref(null)
 const library = ref([])
 const error = ref(null)
 const flash = ref(null)
+
+// Preview modal state — fetched on demand so the signed URLs stay fresh.
+const previewOpen = ref(false)
+const previewLoading = ref(false)
+const previewError = ref('')
+const previewItems = ref([])
+const previewTitle = ref('')
+const previewSubtitle = ref('')
 
 let keyCounter = 0
 const nextKey = () => `k${++keyCounter}`
@@ -143,6 +165,30 @@ async function publish() {
     flash.value = `Notified ${res.notified}/${res.devices} device(s).`
     setTimeout(() => { flash.value = null }, 4000)
   } catch (e) { error.value = e.message }
+}
+
+async function openPreview() {
+  // Save any pending changes first so the preview matches what the
+  // players would actually get. This also guarantees the server-side
+  // item ordering is in sync with our local drag state.
+  previewError.value = ''
+  previewLoading.value = true
+  try {
+    await saveAll()
+    const preview = await api.previewSchedule(schedule.value.id)
+    previewItems.value = preview.items
+    previewTitle.value = `Preview · ${preview.schedule_name}`
+    previewSubtitle.value = preview.items.length
+      ? `${preview.items.length} item(s) · URLs expire in ~15 min`
+      : 'Empty schedule'
+    previewOpen.value = true
+  } catch (e) {
+    previewError.value = e.message
+    previewItems.value = []
+    previewOpen.value = true
+  } finally {
+    previewLoading.value = false
+  }
 }
 
 onMounted(load)

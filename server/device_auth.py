@@ -25,6 +25,21 @@ Tokens can be rotated from the CMS (``POST /api/devices/{id}/rotate-token``)
 which invalidates all outstanding manifests — the player transparently
 re-registers after the next 401 thanks to the stale-device flow added in
 an earlier PR.
+
+Preview URLs (admin)
+====================
+
+The CMS also needs to stream media to logged-in admins for the live
+schedule preview. Those URLs use the **same download endpoint** but a
+different query-string shape:
+
+    /api/media/{id}/download?admin_exp=<ts>&admin_sig=<sig>
+
+The signature is computed with the server's ``secret_key`` (the JWT
+secret) as the HMAC key, so rotating it invalidates every outstanding
+preview link just like rotating a device token invalidates every
+outstanding manifest URL. Preview URLs have a short TTL (15 min) since
+they are generated on demand from an authenticated session.
 """
 from __future__ import annotations
 
@@ -40,16 +55,23 @@ from uuid import UUID
 from fastapi import Depends, Header, HTTPException, Query, Request, status
 from sqlmodel import Session, select
 
+from .config import settings
 from .database import get_session
 from .models import Device
 
 logger = logging.getLogger(__name__)
 
 
-# How long a signed URL remains valid. Longer than the typical sync
-# cycle (once per day is enough) but short enough to bound exposure on
-# leaked manifests.
+# How long a player-signed URL remains valid. Longer than the typical
+# sync cycle (once per day is enough) but short enough to bound exposure
+# on leaked manifests.
 DEFAULT_SIGNATURE_TTL = timedelta(hours=6)
+
+# Preview URLs are opened by authenticated admins from a live browser
+# session so they don't need to survive long. A short TTL keeps any
+# accidental share (copy-pasted URL in a chat) from turning into a
+# lasting access leak.
+DEFAULT_ADMIN_PREVIEW_TTL = timedelta(minutes=15)
 
 
 # ---------------------------------------------------------------------------
@@ -205,3 +227,44 @@ def verify_media_signature(
 def extract_request_base_url(request: Request) -> str:
     """Get a stable base URL ('http://host:port') from the current request."""
     return str(request.base_url).rstrip("/")
+
+
+# ---------------------------------------------------------------------------
+# Admin-signed preview URLs
+# ---------------------------------------------------------------------------
+
+
+def compute_admin_signature(media_id: int, exp: int) -> str:
+    """HMAC-SHA256 over ``<media_id>|<exp>`` using ``settings.secret_key``."""
+    payload = f"{media_id}|{exp}".encode("utf-8")
+    digest = hmac.new(settings.secret_key.encode("utf-8"), payload, sha256).digest()
+    return _b64(digest)
+
+
+def sign_admin_preview_url(
+    base_url: str, media_id: int, ttl: timedelta = DEFAULT_ADMIN_PREVIEW_TTL
+) -> str:
+    """Return an absolute URL that streams *media_id* without requiring
+    the admin's JWT on each ``<img src>`` / ``<video src>`` request."""
+    exp = _unix_ts(datetime.now(tz=timezone.utc) + ttl)
+    sig = compute_admin_signature(media_id, exp)
+    base = base_url.rstrip("/")
+    return (
+        f"{base}/api/media/{media_id}/download"
+        f"?admin_exp={exp}&admin_sig={sig}"
+    )
+
+
+def verify_admin_signature(
+    media_id: int, exp: int, sig: str, now: Optional[datetime] = None
+) -> None:
+    """Raise 403 if the admin-preview signature is wrong or expired."""
+    if exp < _unix_ts(now or datetime.now(tz=timezone.utc)):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="Preview link expired"
+        )
+    expected = compute_admin_signature(media_id, exp)
+    if not hmac.compare_digest(expected, sig):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="Invalid preview signature"
+        )

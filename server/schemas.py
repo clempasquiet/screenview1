@@ -149,6 +149,41 @@ class PlaylistManifestItem(BaseModel):
     duration: int
 
 
+class MediaPreviewUrl(BaseModel):
+    """Short-lived, admin-signed URL suitable for ``<img src>``/``<video src>``."""
+
+    media_id: int
+    url: str
+    mime_type: Optional[str]
+    type: MediaType
+    original_name: str
+    default_duration: int
+
+
+class SchedulePreviewItem(BaseModel):
+    """One entry in the schedule preview playlist. Mirrors
+    ``PlaylistManifestItem`` but carries an admin-signed URL instead of
+    a device-signed one."""
+
+    media_id: int
+    order: int
+    type: MediaType
+    original_name: str
+    mime_type: Optional[str]
+    url: str
+    duration: int
+
+
+class SchedulePreview(BaseModel):
+    """Result of ``GET /api/schedules/{id}/preview`` — the admin-facing
+    equivalent of a player manifest."""
+
+    schedule_id: int
+    schedule_name: str
+    generated_at: datetime
+    items: list[SchedulePreviewItem]
+
+
 class PlaylistManifest(BaseModel):
     """Manifest fetched via GET /api/schedule/{device_id}.
 

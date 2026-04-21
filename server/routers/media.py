@@ -5,18 +5,24 @@ import uuid
 from pathlib import Path
 from typing import Annotated
 
+from typing import Optional
 from uuid import UUID
 
 import aiofiles
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, Response, UploadFile, status
 from fastapi.responses import FileResponse
 from sqlmodel import Session, select
 
 from ..config import settings
 from ..database import get_session
-from ..device_auth import verify_media_signature
+from ..device_auth import (
+    extract_request_base_url,
+    sign_admin_preview_url,
+    verify_admin_signature,
+    verify_media_signature,
+)
 from ..models import Device, Media, MediaType, ScheduleItem
-from ..schemas import MediaRead, MediaUpdate
+from ..schemas import MediaPreviewUrl, MediaRead, MediaUpdate
 from ..security import require_admin
 from ..utils import guess_media_type, md5_of_file
 
@@ -139,30 +145,45 @@ def delete_media(
 def download_media(
     media_id: int,
     session: Annotated[Session, Depends(get_session)],
-    device_id: Annotated[UUID, Query(description="Device that the link was signed for")],
-    exp: Annotated[int, Query(description="Expiry (Unix timestamp, seconds)")],
-    sig: Annotated[str, Query(description="HMAC signature")],
+    device_id: Annotated[Optional[UUID], Query(description="Device that the link was signed for")] = None,
+    exp: Annotated[Optional[int], Query(description="Expiry for a device-signed URL")] = None,
+    sig: Annotated[Optional[str], Query(description="HMAC for a device-signed URL")] = None,
+    admin_exp: Annotated[Optional[int], Query(description="Expiry for an admin preview URL")] = None,
+    admin_sig: Annotated[Optional[str], Query(description="HMAC for an admin preview URL")] = None,
 ) -> FileResponse:
-    """Download endpoint used by players.
+    """Download endpoint used by players and by the CMS preview modal.
 
-    URLs are pre-signed by ``GET /api/schedule/{device_id}`` using the
-    device's ``api_token`` as the HMAC key. Each URL binds a specific
-    device to a specific media item until a specific expiry timestamp.
-    A leaked URL is therefore:
+    Two flavours of signed URL are accepted, distinguished by which
+    query-string parameters are present:
 
-      * useless after ``exp`` passes,
-      * useless from any other ``device_id``,
-      * invalidated globally if the device's token is rotated.
+    * **Device-signed** (``device_id``, ``exp``, ``sig``): pre-signed
+      by ``GET /api/schedule/{device_id}`` using the device's
+      ``api_token``. Default TTL: 6 hours.
+    * **Admin-signed** (``admin_exp``, ``admin_sig``): pre-signed by
+      ``POST /api/media/{id}/preview-url`` with the server's
+      ``secret_key``. Default TTL: 15 minutes. Used by the live preview
+      in the CMS.
+
+    At least one of the two flavours must be present and valid. Neither
+    flavour relies on Authorization headers, so browsers can point
+    ``<img src>`` / ``<video src>`` directly at these URLs.
     """
     media = session.get(Media, media_id)
     if not media:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Media not found")
 
-    device = session.get(Device, device_id)
-    if not device:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Device not registered")
-
-    verify_media_signature(device=device, media_id=media_id, exp=exp, sig=sig)
+    if admin_sig is not None and admin_exp is not None:
+        verify_admin_signature(media_id=media_id, exp=admin_exp, sig=admin_sig)
+    elif device_id is not None and exp is not None and sig is not None:
+        device = session.get(Device, device_id)
+        if not device:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Device not registered")
+        verify_media_signature(device=device, media_id=media_id, exp=exp, sig=sig)
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing signed URL parameters",
+        )
 
     path = settings.upload_dir / media.filename
     if not path.exists():
@@ -171,4 +192,34 @@ def download_media(
         path,
         media_type=media.mime_type or "application/octet-stream",
         filename=media.original_name,
+    )
+
+
+@router.post(
+    "/{media_id}/preview-url",
+    response_model=MediaPreviewUrl,
+    summary="Generate a short-lived admin preview URL",
+)
+def make_preview_url(
+    media_id: int,
+    request: Request,
+    session: Annotated[Session, Depends(get_session)],
+    _admin: Annotated[str, Depends(require_admin)],
+) -> MediaPreviewUrl:
+    """Return an admin-signed URL the browser can embed directly in
+    ``<img>`` / ``<video>`` tags without attaching the admin JWT on
+    each request. The URL expires automatically; re-open the preview
+    to get a fresh one.
+    """
+    media = session.get(Media, media_id)
+    if not media:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Media not found")
+    base = extract_request_base_url(request)
+    return MediaPreviewUrl(
+        media_id=media_id,
+        url=sign_admin_preview_url(base, media_id),
+        mime_type=media.mime_type,
+        type=media.type,
+        original_name=media.original_name,
+        default_duration=media.default_duration,
     )
