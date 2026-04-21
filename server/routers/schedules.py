@@ -1,12 +1,15 @@
 """Schedule/playlist CRUD and per-device manifest generation."""
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlmodel import Session, select
+
+logger = logging.getLogger(__name__)
 
 from ..database import get_session
 from ..device_auth import (
@@ -15,7 +18,7 @@ from ..device_auth import (
     sign_admin_preview_url,
     sign_media_url,
 )
-from ..models import Device, Media, MediaType, Schedule, ScheduleItem
+from ..models import Device, Layout, Media, MediaType, Schedule, ScheduleItem
 from ..schemas import (
     PlaylistManifest,
     PlaylistManifestItem,
@@ -32,51 +35,83 @@ from ..ws_manager import manager
 router = APIRouter(prefix="/api", tags=["schedules"])
 
 
+def _validate_item_xor(item: ScheduleItemIn) -> None:
+    """Enforce the ScheduleItem shape: exactly one of media_id / layout_id.
+
+    See the class docstring on ``models.ScheduleItem`` for why the
+    invariant is validated here rather than via a DB CHECK constraint:
+    SQLite can't add one retroactively without a full table rebuild,
+    and doing that on every boot for a legacy field is overkill.
+
+    Raised errors are 400s with a specific message so the CMS can show
+    the operator exactly what's wrong with their payload.
+    """
+    has_media = item.media_id is not None
+    has_layout = item.layout_id is not None
+    if has_media and has_layout:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail="ScheduleItem cannot specify both media_id and layout_id.",
+        )
+    if not has_media and not has_layout:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail="ScheduleItem must specify media_id OR layout_id.",
+        )
+
+
 def _apply_items(session: Session, schedule: Schedule, items: list[ScheduleItemIn]) -> None:
     """Replace a schedule's items in place, driven by the ORM relationship.
 
-    We mutate ``schedule.items`` **through the relationship** rather than
-    issuing explicit ``session.delete()`` calls on the existing rows.
-    The relationship is declared with ``cascade='all, delete-orphan'``
-    so clearing the list and appending fresh ``ScheduleItem`` rows causes
-    SQLAlchemy to emit the necessary DELETEs for the orphaned items at
-    flush time.
+    Each incoming item is either a **media slot** (legacy, single file
+    on screen) or a **layout slot** (Phase 2, multi-zone canvas). The
+    XOR is enforced by :func:`_validate_item_xor`.
 
-    The previous implementation deleted items manually then flushed,
-    which left ``schedule.items`` populated with deleted-but-still-in-
-    memory objects. The next ``session.add(schedule)`` (e.g. from
+    We mutate ``schedule.items`` **through the relationship** rather
+    than issuing explicit ``session.delete()`` calls on the existing
+    rows. The relationship is declared with
+    ``cascade='all, delete-orphan'`` so clearing the list and appending
+    fresh ``ScheduleItem`` rows causes SQLAlchemy to emit the
+    necessary DELETEs for the orphaned items at flush time.
+
+    An older implementation deleted items manually then flushed, which
+    left ``schedule.items`` populated with deleted-but-still-in-memory
+    objects. The next ``session.add(schedule)`` (e.g. from
     ``update_schedule`` when it refreshes ``updated_at``) then walked
-    the relationship via the cascade and raised:
-
-        Instance '<ScheduleItem …>' has been deleted. Use the
-        make_transient() function to send this object back to the
-        transient state.
-
-    The test suite never caught it because every test that exercised
-    ``_apply_items`` did so on a freshly-created empty schedule, so the
-    loop that deletes existing items was a no-op. Doing a ``PATCH`` on
-    a schedule that already had items triggered the bug on every run.
+    the relationship via the cascade and raised
+    ``InvalidRequestError: Instance has been deleted``. PR #9 fixed
+    that by going through the relationship; we preserve the fix here.
     """
-    # Validate every incoming media_id up-front. We want a 400 response
-    # with the bad id identified, not a partial mutation + 500.
+    # Up-front validation: XOR shape, then FK existence. A bad payload
+    # must return 400 with the existing playlist untouched — never a
+    # 400 on top of a half-wiped schedule.
     for item in items:
-        media = session.get(Media, item.media_id)
-        if not media:
-            raise HTTPException(
-                status.HTTP_400_BAD_REQUEST, detail=f"Media {item.media_id} not found"
-            )
+        _validate_item_xor(item)
+        if item.media_id is not None:
+            if not session.get(Media, item.media_id):
+                raise HTTPException(
+                    status.HTTP_400_BAD_REQUEST,
+                    detail=f"Media {item.media_id} not found",
+                )
+        else:  # layout_id is not None (XOR guaranteed above)
+            if not session.get(Layout, item.layout_id):
+                raise HTTPException(
+                    status.HTTP_400_BAD_REQUEST,
+                    detail=f"Layout {item.layout_id} not found",
+                )
 
     # Drop every existing ScheduleItem via the relationship. The
     # delete-orphan cascade takes care of the DELETEs at flush time.
     schedule.items.clear()
     session.flush()
 
-    # Now attach the new items via the relationship. SQLAlchemy fills
-    # in ``schedule_id`` automatically from the relationship back-ref.
+    # Attach the new items via the relationship. SQLAlchemy fills in
+    # ``schedule_id`` automatically from the relationship back-ref.
     for item in items:
         schedule.items.append(
             ScheduleItem(
                 media_id=item.media_id,
+                layout_id=item.layout_id,
                 order=item.order,
                 duration_override=item.duration_override,
             )
@@ -192,6 +227,17 @@ def get_schedule_preview(
     base = extract_request_base_url(request)
     items: list[SchedulePreviewItem] = []
     for item in sorted(schedule.items, key=lambda i: i.order):
+        # Phase 2 multi-zone slots (layout_id set, media_id NULL) are
+        # intentionally skipped at this layer for now. The preview
+        # endpoint gains a dedicated Layout render path in Step 4 of
+        # the sprint; keeping the change surface tight for Step 1.
+        if item.media_id is None:
+            logger.debug(
+                "Skipping schedule item %s (layout_id=%s) in legacy preview",
+                item.id,
+                item.layout_id,
+            )
+            continue
         media = session.get(Media, item.media_id)
         if not media:
             continue
@@ -266,6 +312,18 @@ def get_device_manifest(
         if schedule:
             base = extract_request_base_url(request)
             for item in sorted(schedule.items, key=lambda i: i.order):
+                # Phase 2 multi-zone slots are not yet emitted in the
+                # player manifest — that's Step 4 of the sprint. For
+                # now we silently skip them so a Schedule mixing legacy
+                # media slots and Layout slots still plays the media
+                # slots correctly on players running the current code.
+                if item.media_id is None:
+                    logger.debug(
+                        "Skipping schedule item %s (layout_id=%s) in legacy manifest",
+                        item.id,
+                        item.layout_id,
+                    )
+                    continue
                 media = session.get(Media, item.media_id)
                 if not media:
                     continue

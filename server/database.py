@@ -139,6 +139,80 @@ def _relax_media_not_null_for_streams() -> None:
         conn.execute(text("PRAGMA foreign_keys = ON"))
 
 
+def _relax_scheduleitem_not_null_for_layouts() -> None:
+    """Drop the NOT NULL constraint on ``scheduleitem.media_id``.
+
+    Phase 2 lets a ScheduleItem point at *either* a Media (legacy) or a
+    Layout (multi-zone canvas). Exactly one is set per row — see the
+    XOR validator in ``routers/schedules.py``. Legacy SQLite databases
+    declared ``media_id`` as NOT NULL, which would block any Layout
+    entry. SQLite can't ``ALTER COLUMN`` to drop a NOT NULL, so we
+    rebuild the table in place. Idempotent; no-op once the column is
+    already nullable. Skipped on non-SQLite backends (PostgreSQL
+    operators can ``ALTER COLUMN ... DROP NOT NULL`` themselves).
+
+    Preserves every other constraint, the FK targets, and the data.
+    """
+    if not settings.database_url.startswith("sqlite"):
+        return
+
+    insp = inspect(engine)
+    if "scheduleitem" not in insp.get_table_names():
+        return
+
+    cols = {c["name"]: c for c in insp.get_columns("scheduleitem")}
+    media_col = cols.get("media_id")
+    if media_col is None:
+        return
+    # Already nullable → no-op.
+    if media_col.get("nullable", True):
+        return
+
+    logger.info("migration: relaxing NOT NULL on scheduleitem.media_id for Phase 2 layouts")
+    with engine.begin() as conn:
+        conn.execute(text("PRAGMA foreign_keys = OFF"))
+        conn.execute(
+            text(
+                'CREATE TABLE "scheduleitem__new" ('
+                '  "id" INTEGER PRIMARY KEY AUTOINCREMENT,'
+                '  "schedule_id" INTEGER NOT NULL REFERENCES "schedule"("id"),'
+                '  "media_id" INTEGER REFERENCES "media"("id"),'
+                '  "layout_id" INTEGER REFERENCES "layout"("id"),'
+                '  "order" INTEGER NOT NULL DEFAULT 0,'
+                '  "duration_override" INTEGER'
+                ')'
+            )
+        )
+        # Copy every column the old table already has. The new
+        # ``layout_id`` stays NULL for pre-existing rows, which is
+        # exactly what we want (legacy single-media slots).
+        new_cols = ("id", "schedule_id", "media_id", "layout_id", "order", "duration_override")
+        existing = [c for c in new_cols if c in cols]
+        cols_sql = ", ".join(f'"{c}"' for c in existing)
+        conn.execute(
+            text(
+                f'INSERT INTO "scheduleitem__new" ({cols_sql}) '
+                f'SELECT {cols_sql} FROM "scheduleitem"'
+            )
+        )
+        conn.execute(text('DROP TABLE "scheduleitem"'))
+        conn.execute(text('ALTER TABLE "scheduleitem__new" RENAME TO "scheduleitem"'))
+        # Re-create the indexes SQLModel declared on the original.
+        conn.execute(
+            text('CREATE INDEX IF NOT EXISTS "ix_scheduleitem_schedule_id" '
+                 'ON "scheduleitem" ("schedule_id")')
+        )
+        conn.execute(
+            text('CREATE INDEX IF NOT EXISTS "ix_scheduleitem_media_id" '
+                 'ON "scheduleitem" ("media_id")')
+        )
+        conn.execute(
+            text('CREATE INDEX IF NOT EXISTS "ix_scheduleitem_layout_id" '
+                 'ON "scheduleitem" ("layout_id")')
+        )
+        conn.execute(text("PRAGMA foreign_keys = ON"))
+
+
 def init_db() -> None:
     """Create tables and run lightweight migrations."""
     from . import models  # noqa: F401  # ensure models are registered
@@ -155,6 +229,13 @@ def init_db() -> None:
     # carries the upstream URL.
     _ensure_column("media", "stream_url", "VARCHAR")
     _relax_media_not_null_for_streams()
+    # Phase 2 multi-zone support: ScheduleItem can point at a Layout
+    # instead of a single Media. ``layout_id`` column + relaxed
+    # ``media_id`` NOT NULL. The ``layout`` / ``zone`` / ``zoneitem``
+    # tables themselves are created by ``SQLModel.metadata.create_all``
+    # above — only the ``scheduleitem`` delta needs hand-crafting.
+    _ensure_column("scheduleitem", "layout_id", "INTEGER REFERENCES layout(id)")
+    _relax_scheduleitem_not_null_for_layouts()
 
 
 def get_session() -> Iterator[Session]:

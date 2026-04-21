@@ -20,7 +20,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .config import settings
 from .database import init_db
-from .routers import auth, devices, media, schedules, websocket
+from .routers import auth, devices, layouts, media, schedules, websocket
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
@@ -50,6 +50,7 @@ app.include_router(auth.router)
 app.include_router(devices.router)
 app.include_router(media.router)
 app.include_router(schedules.router)
+app.include_router(layouts.router)
 app.include_router(websocket.router)
 
 app.mount("/uploads", StaticFiles(directory=str(settings.upload_dir)), name="uploads")
