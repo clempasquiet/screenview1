@@ -1,0 +1,17 @@
+services:
+  screenview-server:
+    build: ./server
+    container_name: screenview-server
+    environment:
+      SCREENVIEW_ADMIN_USERNAME: ${SCREENVIEW_ADMIN_USERNAME:-admin}
+      SCREENVIEW_ADMIN_PASSWORD: ${SCREENVIEW_ADMIN_PASSWORD:-admin}
+      SCREENVIEW_SECRET_KEY: ${SCREENVIEW_SECRET_KEY:-change-me-in-production}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./server/uploads:/app/uploads
+      - screenview-db:/app/data
+    restart: unless-stopped
+
+volumes:
+  screenview-db:
