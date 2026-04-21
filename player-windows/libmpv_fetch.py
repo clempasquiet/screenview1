@@ -13,14 +13,27 @@ step is a frequent footgun when deploying kiosks, so this module:
   * Returns the directory holding the DLL so ``player_ui.py`` can prepend
     it to ``PATH``.
 
-The download is best-effort: if it fails (no internet, firewall, rate
-limit, no 7z extractor available), the function simply returns ``None``
-and the player boots without video playback — images and widgets still
-work, and the placeholder frame renders on video items.
+Extraction is the tricky part. The mpv release archives are ``.7z`` files
+that use the **BCJ2** filter for binary optimisation, which ``py7zr``
+(pure-Python) does not implement. We therefore bootstrap the official
+standalone ``7zr.exe`` (~600 KB) from 7-zip.org on first need, cache it
+next to the DLL under ``%LOCALAPPDATA%\\ScreenView\\libmpv\\``, and reuse
+it forever after. Extraction order:
+
+  1. ``7zr.exe`` (bootstrapped, or from a pre-existing install)
+  2. Any ``7z.exe`` / ``7zr.exe`` already on ``PATH``
+  3. ``py7zr`` — only works on archives without BCJ2; kept as a last
+     resort so offline deployments with py7zr pre-installed can still
+     succeed on non-BCJ2 archives.
+  4. ``tar.exe`` — some Windows builds ship libarchive with 7z support.
+
+The whole pipeline is best-effort: **any failure is swallowed and logged
+at WARNING level**. The caller (``player_ui.py``) treats a ``None``
+return as "no video playback; show placeholder for video items" — the
+player UI itself never crashes because the DLL could not be fetched.
 """
 from __future__ import annotations
 
-import io
 import json
 import logging
 import os
@@ -39,6 +52,12 @@ logger = logging.getLogger(__name__)
 DLL_NAMES = ("libmpv-2.dll", "mpv-2.dll", "mpv-1.dll")
 RELEASE_API_URL = "https://api.github.com/repos/zhongfly/mpv-winbuild/releases/latest"
 USER_AGENT = "screenview-player/1.0 (+https://github.com/clempasquiet/screenview1)"
+
+# Official standalone 7-Zip console extractor. Signed, ~600 KB, supports every
+# 7z filter including BCJ2 that ``py7zr`` cannot handle.
+SEVENZR_URL = "https://www.7-zip.org/a/7zr.exe"
+SEVENZR_MIN_SIZE = 100 * 1024   # sanity bound; the real file is ~600 KB
+SEVENZR_MAX_SIZE = 10 * 1024 * 1024
 
 
 def find_existing_dll(search_dirs: Iterable[Path]) -> Optional[Path]:
@@ -95,10 +114,36 @@ def ensure_libmpv(
 ) -> Optional[Path]:
     """Return the directory holding ``libmpv-2.dll``, downloading if needed.
 
-    Returns ``None`` if the DLL is absent and cannot be fetched — the
-    caller must tolerate this (``player_ui.py`` degrades gracefully to
-    a placeholder on video items).
+    This helper **never raises**. Any unexpected error is caught and logged
+    at WARNING level; the function simply returns ``None`` in that case.
+    The caller (``player_ui.py``) treats ``None`` as "no video playback;
+    the placeholder frame will render for video items".
     """
+    try:
+        return _ensure_libmpv_inner(
+            bundled_dir=bundled_dir,
+            app_data_dir=app_data_dir,
+            libmpv_dir=libmpv_dir,
+            allow_download=allow_download,
+            variant=variant,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "libmpv auto-provisioning aborted unexpectedly: %s: %s",
+            type(exc).__name__,
+            exc,
+        )
+        logger.debug("libmpv auto-provisioning traceback:", exc_info=True)
+        return None
+
+
+def _ensure_libmpv_inner(
+    bundled_dir: Path | None,
+    app_data_dir: Path | None,
+    libmpv_dir: str | None,
+    allow_download: bool,
+    variant: str,
+) -> Optional[Path]:
     search = default_search_dirs(
         bundled_dir=bundled_dir, app_data_dir=app_data_dir, libmpv_dir=libmpv_dir
     )
@@ -148,7 +193,6 @@ def _download_libmpv(target_dir: Path, variant: str = "x86_64") -> Optional[Path
     """
     logger.info("libmpv DLL missing; attempting automatic download.")
 
-    # 1. Find the latest release asset.
     try:
         payload = _http_get(RELEASE_API_URL, timeout=30)
         release = json.loads(payload.decode("utf-8", errors="replace"))
@@ -173,11 +217,15 @@ def _download_libmpv(target_dir: Path, variant: str = "x86_64") -> Optional[Path
         logger.warning("Release asset missing url/name: %s", asset)
         return None
 
-    logger.info("Downloading %s (~%d MB)…", asset_name, int(asset.get("size", 0) // (1024 * 1024)))
+    logger.info(
+        "Downloading %s (~%d MB)…",
+        asset_name,
+        int(asset.get("size", 0) // (1024 * 1024)),
+    )
 
-    with tempfile.TemporaryDirectory(prefix="screenview-libmpv-") as tmp:
-        tmp_path = Path(tmp)
-        archive = tmp_path / asset_name
+    tmp_dir = Path(tempfile.mkdtemp(prefix="screenview-libmpv-"))
+    try:
+        archive = tmp_dir / asset_name
         try:
             data = _http_get(asset_url, timeout=300)
             archive.write_bytes(data)
@@ -185,10 +233,10 @@ def _download_libmpv(target_dir: Path, variant: str = "x86_64") -> Optional[Path
             logger.warning("Download failed: %s", exc)
             return None
 
-        extract_dir = tmp_path / "extracted"
+        extract_dir = tmp_dir / "extracted"
         extract_dir.mkdir()
 
-        if not _extract_archive(archive, extract_dir):
+        if not _extract_archive(archive, extract_dir, persistent_tools_dir=target_dir):
             return None
 
         extracted_dll = _find_dll_in_tree(extract_dir)
@@ -202,86 +250,210 @@ def _download_libmpv(target_dir: Path, variant: str = "x86_64") -> Optional[Path
         except OSError as exc:
             logger.warning("Could not copy DLL to %s: %s", destination, exc)
             return None
+        return destination
+    finally:
+        _rmtree_best_effort(tmp_dir)
 
-    return destination
+
+def _rmtree_best_effort(path: Path) -> None:
+    """Like ``shutil.rmtree`` but swallows everything.
+
+    Windows can hold a file lock briefly after a subprocess exits (and even
+    longer when an external AV scans the freshly-written bytes). We care
+    about the happy path, not the cleanup, so missing / locked files
+    should never escape this function.
+    """
+    def _onerror(func, fn, exc_info):  # noqa: ANN001
+        logger.debug("rmtree could not remove %s: %s", fn, exc_info[1])
+
+    try:
+        shutil.rmtree(path, onerror=_onerror)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("rmtree(%s) raised %s: %s", path, type(exc).__name__, exc)
 
 
-def _extract_archive(archive: Path, dest: Path) -> bool:
+# ---------------------------------------------------------------------------
+# Archive extraction
+# ---------------------------------------------------------------------------
+
+
+def _extract_archive(
+    archive: Path, dest: Path, persistent_tools_dir: Path | None = None
+) -> bool:
     """Extract *archive* into *dest*. Returns True on success.
 
-    Tries, in order:
-      1. ``py7zr`` — pure-Python 7z library. Always works when the package
-         is installed (listed in requirements.txt).
-      2. External ``7z.exe`` / ``7zr.exe`` — honours any pre-existing
-         7-Zip install.
-      3. ``tar.exe`` (bsdtar with libarchive) on Windows 10 1803+. Note
-         that some Windows builds ship a libarchive without 7z support,
-         so this is genuinely a last-resort fallback.
+    Extractor preference:
+      1. A cached or newly-bootstrapped ``7zr.exe`` (official standalone
+         console extractor from 7-zip.org). This is the only option that
+         reliably handles the BCJ2 filter used by the mpv release archives.
+      2. An existing ``7z.exe`` / ``7zr.exe`` on ``PATH``.
+      3. ``py7zr`` — works on archives that don't use BCJ2.
+      4. ``tar.exe`` as a true last resort.
+
+    ``persistent_tools_dir`` is where we store the bootstrapped
+    ``7zr.exe`` between runs. Pass ``None`` to disable bootstrapping.
     """
+    commands: list[list[str]] = []
+
+    seven_zr = _ensure_7zr(persistent_tools_dir) if persistent_tools_dir else None
+    if seven_zr is not None:
+        commands.append([str(seven_zr), "x", "-y", f"-o{dest}", str(archive)])
+
+    commands.extend(_external_extractor_commands(archive, dest))
+
+    for cmd in commands:
+        if _run_extractor(cmd):
+            return True
+
     if _extract_with_py7zr(archive, dest):
         return True
 
-    commands = _extractor_commands(archive, dest)
-    for cmd in commands:
-        try:
-            result = subprocess.run(  # noqa: S603  # args are a trusted list
-                cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                check=False,
-                creationflags=_no_window_flag(),
-            )
-        except (OSError, subprocess.SubprocessError) as exc:
-            logger.debug("Extractor %s unavailable: %s", cmd[0], exc)
-            continue
-        if result.returncode == 0:
-            return True
-        logger.debug(
-            "Extractor %s exited %s: %s",
-            cmd[0],
-            result.returncode,
-            (result.stderr or b"").decode("utf-8", errors="replace").strip(),
-        )
+    commands_tar = _tar_extractor_command(archive, dest)
+    if commands_tar and _run_extractor(commands_tar):
+        return True
+
     logger.warning(
-        "No working 7z extractor found. Install py7zr (pip install py7zr) "
-        "or 7-Zip, or run scripts/fetch-libmpv.ps1 from a machine that has one."
+        "Could not extract %s with any available 7z tool. Install 7-Zip "
+        "(https://www.7-zip.org/) or ensure internet access so 7zr.exe can "
+        "be bootstrapped automatically.",
+        archive.name,
     )
     return False
+
+
+def _run_extractor(cmd: list[str]) -> bool:
+    try:
+        result = subprocess.run(  # noqa: S603  # args are a trusted list
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            check=False,
+            creationflags=_no_window_flag(),
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.debug("Extractor %s unavailable: %s", cmd[0], exc)
+        return False
+    if result.returncode == 0:
+        return True
+    logger.debug(
+        "Extractor %s exited %s: %s",
+        cmd[0],
+        result.returncode,
+        (result.stderr or b"").decode("utf-8", errors="replace").strip(),
+    )
+    return False
+
+
+def _external_extractor_commands(archive: Path, dest: Path) -> list[list[str]]:
+    candidates: list[list[str]] = []
+    for exe in ("7z.exe", "7zr.exe", "7z"):
+        full = shutil.which(exe)
+        if full:
+            candidates.append([full, "x", "-y", f"-o{dest}", str(archive)])
+    return candidates
+
+
+def _tar_extractor_command(archive: Path, dest: Path) -> list[str] | None:
+    tar = shutil.which("tar.exe") or shutil.which("tar")
+    if not tar:
+        return None
+    return [tar, "-xf", str(archive), "-C", str(dest)]
 
 
 def _extract_with_py7zr(archive: Path, dest: Path) -> bool:
     try:
         import py7zr  # type: ignore[import-not-found]
     except ImportError:
-        logger.debug("py7zr not available; falling back to external extractors.")
+        logger.debug("py7zr not available; falling back to other extractors.")
         return False
     try:
         with py7zr.SevenZipFile(str(archive), mode="r") as zf:
             zf.extractall(path=str(dest))
     except Exception as exc:  # noqa: BLE001
-        logger.warning("py7zr extraction failed: %s", exc)
+        # The mpv dev archives use the BCJ2 filter which py7zr does not
+        # support; this is expected and handled by falling through to
+        # the external ``7zr.exe`` path.
+        logger.debug("py7zr extraction failed (expected for BCJ2 archives): %s", exc)
         return False
     return True
 
 
-def _extractor_commands(archive: Path, dest: Path) -> list[list[str]]:
-    candidates: list[list[str]] = []
-    for exe in ("7z.exe", "7zr.exe", "7z"):
-        full = shutil.which(exe)
-        if full:
-            candidates.append([full, "x", "-y", f"-o{dest}", str(archive)])
+# ---------------------------------------------------------------------------
+# 7zr.exe bootstrap
+# ---------------------------------------------------------------------------
 
-    tar = shutil.which("tar.exe") or shutil.which("tar")
-    if tar:
-        candidates.append([tar, "-xf", str(archive), "-C", str(dest)])
-    return candidates
+
+def _ensure_7zr(tools_dir: Path) -> Path | None:
+    """Return a path to a working ``7zr.exe``.
+
+    Preference order:
+      1. A copy we already bootstrapped into ``tools_dir``.
+      2. An existing ``7zr.exe`` / ``7z.exe`` on ``PATH``.
+      3. Downloaded from the official 7-zip.org URL and cached in
+         ``tools_dir`` for future runs.
+
+    Returns ``None`` if every avenue fails.
+    """
+    cached = tools_dir / "7zr.exe"
+    if cached.is_file() and cached.stat().st_size >= SEVENZR_MIN_SIZE:
+        return cached
+
+    for exe in ("7zr.exe", "7z.exe"):
+        found = shutil.which(exe)
+        if found:
+            return Path(found)
+
+    if sys.platform != "win32":
+        return None
+
+    try:
+        tools_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        logger.warning("Cannot create tools dir %s: %s", tools_dir, exc)
+        return None
+
+    logger.info("Bootstrapping 7zr.exe from %s…", SEVENZR_URL)
+    try:
+        data = _http_get(SEVENZR_URL, timeout=60)
+    except (URLError, OSError) as exc:
+        logger.warning("Could not download 7zr.exe: %s", exc)
+        return None
+
+    if not (SEVENZR_MIN_SIZE <= len(data) <= SEVENZR_MAX_SIZE) or data[:2] != b"MZ":
+        logger.warning(
+            "Downloaded 7zr.exe looks wrong (size=%d, magic=%r); ignoring.",
+            len(data),
+            data[:2],
+        )
+        return None
+
+    # Atomic write: temp name on same volume → rename. Avoids anti-virus
+    # races where a partial file is being scanned.
+    tmp = cached.with_suffix(".part")
+    try:
+        tmp.write_bytes(data)
+        if cached.exists():
+            try:
+                cached.unlink()
+            except OSError:
+                pass
+        tmp.replace(cached)
+    except OSError as exc:
+        logger.warning("Could not persist 7zr.exe at %s: %s", cached, exc)
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        return None
+
+    logger.info("Cached 7zr.exe at %s (%d bytes)", cached, cached.stat().st_size)
+    return cached
 
 
 def _find_dll_in_tree(root: Path) -> Optional[Path]:
     for name in DLL_NAMES:
         matches = list(root.rglob(name))
         if matches:
-            # Prefer x86_64 builds over any nested arch subdirs just in case.
             return matches[0]
     return None
 
