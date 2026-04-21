@@ -473,6 +473,193 @@ def test_device_download_still_rejects_admin_shaped_params(client: TestClient) -
     assert resp.status_code == 401
 
 
+def test_create_stream_media_minimal(client: TestClient) -> None:
+    headers = _admin_auth(client)
+    resp = client.post(
+        "/api/media/stream",
+        headers=headers,
+        json={
+            "name": "Lobby camera",
+            "url": "rtsp://10.0.0.42:554/live",
+            "default_duration": 60,
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["type"] == "stream"
+    assert body["stream_url"] == "rtsp://10.0.0.42:554/live"
+    assert body["filename"] is None
+    assert body["md5_hash"] is None
+    assert body["default_duration"] == 60
+
+
+def test_create_stream_requires_admin(client: TestClient) -> None:
+    resp = client.post(
+        "/api/media/stream",
+        json={"name": "x", "url": "https://example.com/s.m3u8", "default_duration": 30},
+    )
+    assert resp.status_code == 401
+
+
+def test_create_stream_rejects_dangerous_schemes(client: TestClient) -> None:
+    headers = _admin_auth(client)
+    bad_urls = [
+        "file:///etc/passwd",
+        "javascript:alert(1)",
+        "data:text/html,<script>",
+        "ftp://example.com/foo",
+        "",
+        "not-a-url",
+        "http:",
+    ]
+    for url in bad_urls:
+        resp = client.post(
+            "/api/media/stream",
+            headers=headers,
+            json={"name": "n", "url": url, "default_duration": 10},
+        )
+        assert resp.status_code == 400, f"expected 400 for {url!r}, got {resp.status_code}"
+
+
+def test_create_stream_rejects_zero_duration(client: TestClient) -> None:
+    headers = _admin_auth(client)
+    resp = client.post(
+        "/api/media/stream",
+        headers=headers,
+        json={"name": "n", "url": "https://e/s.m3u8", "default_duration": 0},
+    )
+    assert resp.status_code == 400
+
+
+def test_stream_appears_in_player_manifest_with_upstream_url(client: TestClient) -> None:
+    headers = _admin_auth(client)
+
+    reg = client.post("/api/register", json={"mac_address": "ab:cd:ef:01:02:03"})
+    device = reg.json()
+    device_id = device["id"]
+    token = device["api_token"]
+
+    stream_resp = client.post(
+        "/api/media/stream",
+        headers=headers,
+        json={
+            "name": "Live HLS",
+            "url": "https://cdn.example.com/playlist.m3u8",
+            "default_duration": 45,
+        },
+    )
+    stream_id = stream_resp.json()["id"]
+
+    sched = client.post(
+        "/api/schedules",
+        headers=headers,
+        json={"name": "Live", "items": [{"media_id": stream_id, "order": 0}]},
+    )
+    schedule_id = sched.json()["id"]
+
+    client.patch(
+        f"/api/devices/{device_id}",
+        headers=headers,
+        json={"status": "active", "current_schedule_id": schedule_id},
+    )
+
+    manifest = client.get(
+        f"/api/schedule/{device_id}", headers=_device_auth(token)
+    )
+    assert manifest.status_code == 200
+    item = manifest.json()["items"][0]
+    # The upstream URL is passed through verbatim — no signature, no
+    # device binding, no expiry. md5/size are zeroed out so the player
+    # knows to skip the cache pipeline.
+    assert item["url"] == "https://cdn.example.com/playlist.m3u8"
+    assert item["type"] == "stream"
+    assert item["md5_hash"] == ""
+    assert item["size_bytes"] == 0
+    assert item["duration"] == 45
+
+
+def test_stream_preview_returns_upstream_url(client: TestClient) -> None:
+    headers = _admin_auth(client)
+    stream_resp = client.post(
+        "/api/media/stream",
+        headers=headers,
+        json={
+            "name": "Camera 7",
+            "url": "rtsp://10.0.0.7:554/stream1",
+            "default_duration": 30,
+        },
+    )
+    stream_id = stream_resp.json()["id"]
+
+    # Single-media preview URL: returns the upstream URL verbatim.
+    preview = client.post(
+        f"/api/media/{stream_id}/preview-url", headers=headers
+    )
+    assert preview.status_code == 200
+    assert preview.json()["url"] == "rtsp://10.0.0.7:554/stream1"
+
+    # Schedule preview: same.
+    sched = client.post(
+        "/api/schedules",
+        headers=headers,
+        json={"name": "PreviewLive", "items": [{"media_id": stream_id, "order": 0}]},
+    )
+    sched_preview = client.get(
+        f"/api/schedules/{sched.json()['id']}/preview", headers=headers
+    )
+    assert sched_preview.status_code == 200
+    assert sched_preview.json()["items"][0]["url"] == "rtsp://10.0.0.7:554/stream1"
+
+
+def test_stream_download_endpoint_returns_400(client: TestClient) -> None:
+    """A misbehaving client that hits /download for a stream item with a
+    valid admin signature should still get a clear 400 instead of a 500
+    or a stale FileResponse."""
+    headers = _admin_auth(client)
+    stream_resp = client.post(
+        "/api/media/stream",
+        headers=headers,
+        json={"name": "x", "url": "rtsp://x/y", "default_duration": 10},
+    )
+    stream_id = stream_resp.json()["id"]
+
+    # Hand-craft a valid admin signature for the stream's media_id.
+    exp = int(time.time()) + 300
+    secret_key = "change-me-in-production"
+    payload = f"{stream_id}|{exp}".encode("utf-8")
+    import base64
+
+    sig = (
+        base64.urlsafe_b64encode(
+            hmac.new(secret_key.encode("utf-8"), payload, sha256).digest()
+        )
+        .rstrip(b"=")
+        .decode("ascii")
+    )
+
+    resp = client.get(
+        f"/api/media/{stream_id}/download",
+        params={"admin_exp": exp, "admin_sig": sig},
+    )
+    assert resp.status_code == 400
+    assert "stream" in resp.json()["detail"].lower()
+
+
+def test_stream_can_be_deleted(client: TestClient) -> None:
+    """Streams have no on-disk file; delete must not blow up trying to
+    unlink a non-existent path."""
+    headers = _admin_auth(client)
+    stream_resp = client.post(
+        "/api/media/stream",
+        headers=headers,
+        json={"name": "x", "url": "rtsp://x/y", "default_duration": 10},
+    )
+    stream_id = stream_resp.json()["id"]
+
+    resp = client.delete(f"/api/media/{stream_id}", headers=headers)
+    assert resp.status_code == 204
+
+
 def test_websocket_unknown_device_closes_with_4404(client: TestClient) -> None:
     """Unknown device_id still returns the dedicated 4404 code so the
     player can distinguish "I don't exist" from "my token is wrong"."""
