@@ -8,6 +8,11 @@ Responsibilities (all strictly off the UI thread):
   * On request, pull the manifest from `GET /api/schedule/{device_id}`, diff
     it against the local cache, download missing media, verify MD5 hashes,
     and finally emit `playlist_ready` to the UI thread.
+  * Self-heal when the server has forgotten this device (e.g. SQLite DB
+    reset, or device deleted in the CMS). Both the manifest endpoint
+    (`404`) and the WebSocket (`403`/close code `4404`) are treated as
+    "stale credentials": the worker clears ``device_id`` from its local
+    config and re-registers from scratch.
 
 Communication with the UI thread goes through PyQt signals only; no direct
 attribute access, no shared mutable state.
@@ -35,6 +40,21 @@ from hardware import get_hardware_id, get_mac_address
 
 logger = logging.getLogger(__name__)
 
+# Close codes that the server emits when a device is unknown. See
+# server/routers/websocket.py (``close(code=4404)``) and the
+# ``REDIRECT_STATUS_CODE`` that Starlette returns when a WS is closed
+# before ``accept()`` (HTTP 403 on the handshake).
+WS_UNKNOWN_DEVICE_CLOSE_CODES = (4404,)
+
+# Upper bound for the WebSocket reconnect backoff, in seconds. Prevents
+# the player from spamming the server (and the log file) when the
+# network is unreachable or the server keeps closing the handshake.
+WS_BACKOFF_MAX = 300
+
+# Minimum backoff. Starts here and doubles on every failure until
+# WS_BACKOFF_MAX, reset on every successful connection.
+WS_BACKOFF_MIN = 5
+
 
 @dataclass
 class PlaylistEntry:
@@ -45,6 +65,13 @@ class PlaylistEntry:
     path: Path
     duration: int
     original_name: str
+
+
+class _StaleDeviceError(RuntimeError):
+    """Raised when the server returns 404/403 for a known device_id.
+
+    Triggers a full re-registration cycle in the worker.
+    """
 
 
 class NetworkWorker(QObject):
@@ -62,18 +89,41 @@ class NetworkWorker(QObject):
         self._ws: websocket.WebSocketApp | None = None
         self._running = True
         self._cache_dir = config.cache_path
+        # Track the last WS error message so we don't spam identical lines
+        # at the UI every few seconds during a long outage.
+        self._last_ws_error: str | None = None
+        # Flag set from WS callbacks; the outer reconnect loop consumes it
+        # to decide whether to wipe the local device_id and re-register.
+        self._ws_requires_reregister = False
+        # Tame the websocket-client library's own logging, which dumps the
+        # full HTTP response headers on every handshake failure.
+        logging.getLogger("websocket").setLevel(logging.CRITICAL)
 
     # ----- lifecycle -----------------------------------------------------
 
     def start(self) -> None:
-        """Entry point — runs on the worker thread."""
-        try:
-            self._ensure_registered()
-            self._sync()
-            self._run_ws_loop()
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("Worker crashed: %s", exc)
-            self.status_changed.emit("error", f"Worker crashed: {exc}")
+        """Entry point — runs on the worker thread.
+
+        The top-level loop allows us to restart the whole registration +
+        sync + WS cycle after a forced re-registration without unwinding
+        back to Qt's thread machinery.
+        """
+        while self._running:
+            try:
+                self._ensure_registered()
+                self._sync()
+                self._run_ws_loop()
+            except _StaleDeviceError:
+                self._forget_device("server no longer recognises this device")
+                continue
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Worker crashed: %s", exc)
+                self.status_changed.emit("error", f"Worker crashed: {exc}")
+                # Don't tight-loop on programming errors.
+                time.sleep(5)
+            # Normal exit path (stop requested) — leave the loop.
+            if not self._running:
+                break
 
     def stop(self) -> None:
         self._running = False
@@ -84,6 +134,18 @@ class NetworkWorker(QObject):
                 pass
 
     # ----- registration --------------------------------------------------
+
+    def _forget_device(self, reason: str) -> None:
+        logger.warning("Forgetting stored device_id: %s", reason)
+        self.status_changed.emit(
+            "warn", f"Re-registering device: {reason}"
+        )
+        self._config.device_id = None
+        self._config.device_name = None
+        try:
+            self._config.save()
+        except OSError as exc:
+            logger.warning("Could not persist cleared config: %s", exc)
 
     def _ensure_registered(self) -> None:
         if self._config.device_id:
@@ -124,9 +186,22 @@ class NetworkWorker(QObject):
                 f"{self._config.server_url}/api/schedule/{self._config.device_id}",
                 timeout=15,
             )
+        except requests.RequestException as exc:
+            self.status_changed.emit("warn", f"Manifest fetch failed: {exc}")
+            return
+
+        if resp.status_code in (403, 404):
+            # The server has never heard of this device_id (or no longer
+            # does). Abort this sync; the outer loop will re-register.
+            raise _StaleDeviceError(
+                f"manifest endpoint returned {resp.status_code} for "
+                f"device {self._config.device_id}"
+            )
+
+        try:
             resp.raise_for_status()
             manifest: dict[str, Any] = resp.json()
-        except Exception as exc:  # noqa: BLE001
+        except (requests.RequestException, ValueError) as exc:
             self.status_changed.emit("warn", f"Manifest fetch failed: {exc}")
             return
 
@@ -203,8 +278,13 @@ class NetworkWorker(QObject):
         if not self._config.device_id:
             return
         ws_url = f"{self._config.ws_url}/ws/player/{self._config.device_id}"
+        backoff = WS_BACKOFF_MIN
+        self._ws_requires_reregister = False
 
         def on_open(ws: websocket.WebSocket) -> None:
+            nonlocal backoff
+            backoff = WS_BACKOFF_MIN
+            self._last_ws_error = None
             ws.send(json.dumps({"type": "hello"}))
             self.status_changed.emit("info", "Connected to server.")
 
@@ -217,15 +297,28 @@ class NetworkWorker(QObject):
                 _ws.send(json.dumps({"type": "pong"}))
                 return
             if msg.get("action") == "sync_required":
-                self._sync()
+                try:
+                    self._sync()
+                except _StaleDeviceError:
+                    # Signal the outer loop to restart; closing the WS
+                    # unblocks ``run_forever``.
+                    self._ws_requires_reregister = True
+                    _ws.close()
 
         def on_error(_ws: websocket.WebSocket, err: Exception) -> None:
-            self.status_changed.emit("warn", f"WS error: {err}")
+            msg = _compact_ws_error(err)
+            if msg != self._last_ws_error:
+                self._last_ws_error = msg
+                self.status_changed.emit("warn", f"Server link: {msg}")
+            if _is_unknown_device_error(err):
+                self._ws_requires_reregister = True
 
-        def on_close(*_a: Any) -> None:
-            self.status_changed.emit("warn", "Server connection lost.")
+        def on_close(ws: websocket.WebSocket, close_code: int | None, reason: str | None) -> None:
+            if close_code in WS_UNKNOWN_DEVICE_CLOSE_CODES:
+                self._ws_requires_reregister = True
 
         while self._running:
+            self._ws_requires_reregister = False
             try:
                 self._ws = websocket.WebSocketApp(
                     ws_url,
@@ -236,9 +329,24 @@ class NetworkWorker(QObject):
                 )
                 self._ws.run_forever(ping_interval=20, ping_timeout=10)
             except Exception as exc:  # noqa: BLE001
-                self.status_changed.emit("warn", f"WS loop exception: {exc}")
-            if self._running:
-                time.sleep(self._config.reconnect_delay_seconds)
+                msg = _compact_ws_error(exc)
+                if msg != self._last_ws_error:
+                    self._last_ws_error = msg
+                    self.status_changed.emit("warn", f"WS loop exception: {msg}")
+                if _is_unknown_device_error(exc):
+                    self._ws_requires_reregister = True
+
+            if self._ws_requires_reregister:
+                raise _StaleDeviceError(
+                    "WebSocket handshake rejected; server does not know this device"
+                )
+
+            if not self._running:
+                return
+            # Exponential backoff, capped. Reset to WS_BACKOFF_MIN on successful
+            # open (see on_open).
+            time.sleep(min(backoff, WS_BACKOFF_MAX))
+            backoff = min(backoff * 2, WS_BACKOFF_MAX)
 
 
 def start_in_thread(config: PlayerConfig) -> tuple[QThread, NetworkWorker]:
@@ -259,3 +367,34 @@ def _md5(path: Path) -> str:
                 break
             md5.update(chunk)
     return md5.hexdigest()
+
+
+def _compact_ws_error(err: Exception | str) -> str:
+    """Shorten websocket-client error messages for end-user logs.
+
+    The library's handshake error looks like
+    ``Handshake status 403 Forbidden -+-+- {headers...} -+-+- b''``.
+    Trim everything after the first ``-+-+-`` so the status code is
+    still visible but the headers don't flood the log.
+    """
+    text = str(err)
+    marker = "-+-+-"
+    if marker in text:
+        text = text.split(marker, 1)[0].strip()
+    return text or err.__class__.__name__
+
+
+def _is_unknown_device_error(err: Exception | str) -> bool:
+    """Best-effort detector for 'server does not know this device'.
+
+    Starlette closes a WebSocket with ``websocket.close()`` before
+    ``accept()``, which the client sees as an HTTP 403 handshake
+    failure. We also accept the proper WebSocket close code 4404 that
+    we emit when the app accepts the handshake but then closes.
+    """
+    text = str(err)
+    if "403" in text and "Handshake" in text:
+        return True
+    if "4404" in text:
+        return True
+    return False
