@@ -115,16 +115,30 @@ class StreamCreate(BaseModel):
 
 
 class ScheduleItemIn(BaseModel):
-    media_id: int
+    """Payload for creating / updating a single slot in a Schedule.
+
+    Dual shape, XOR-validated by the schedules router (see
+    ``_validate_item_xor``). A given ``ScheduleItemIn`` must specify
+    exactly one of ``media_id`` (legacy single-media slot) or
+    ``layout_id`` (Phase 2 multi-zone slot). Supplying both, or
+    neither, is rejected with ``400 Bad Request``.
+    """
+
+    media_id: Optional[int] = None
+    layout_id: Optional[int] = None
     order: int = 0
     duration_override: Optional[int] = None
 
 
 class ScheduleItemRead(BaseModel):
+    """Mirror of ``ScheduleItemIn``: exactly one of ``media_id`` /
+    ``layout_id`` will be populated for any row returned by the API."""
+
     model_config = ConfigDict(from_attributes=True)
 
     id: int
-    media_id: int
+    media_id: Optional[int] = None
+    layout_id: Optional[int] = None
     order: int
     duration_override: Optional[int]
 
@@ -229,3 +243,83 @@ class TokenResponse(BaseModel):
 class LoginIn(BaseModel):
     username: str
     password: str
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — Layouts / Zones / ZoneItems
+# ---------------------------------------------------------------------------
+
+
+class ZoneItemIn(BaseModel):
+    """One entry in a Zone's playlist. Mirrors ``ScheduleItemIn`` but
+    always points at a Media (Zones cannot nest Layouts)."""
+
+    media_id: int
+    order: int = 0
+    duration_override: Optional[int] = None
+
+
+class ZoneItemRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    media_id: int
+    order: int
+    duration_override: Optional[int]
+
+
+class ZoneIn(BaseModel):
+    """Create or replace a Zone inside a Layout."""
+
+    name: Optional[str] = "Zone"
+    position_x: int = 0
+    position_y: int = 0
+    width: int
+    height: int
+    z_index: int = 0
+    items: list[ZoneItemIn] = []
+
+
+class ZoneRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    layout_id: int
+    name: str
+    position_x: int
+    position_y: int
+    width: int
+    height: int
+    z_index: int
+    items: list[ZoneItemRead] = []
+
+
+class LayoutCreate(BaseModel):
+    name: str
+    description: Optional[str] = None
+    resolution_w: int = 1920
+    resolution_h: int = 1080
+    zones: list[ZoneIn] = []
+
+
+class LayoutUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    resolution_w: Optional[int] = None
+    resolution_h: Optional[int] = None
+    # When provided, replaces the Zone list wholesale (same semantics as
+    # ``ScheduleUpdate.items``). Leave ``None`` to patch metadata only.
+    zones: Optional[list[ZoneIn]] = None
+
+
+class LayoutRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
+    description: Optional[str]
+    resolution_w: int
+    resolution_h: int
+    created_at: datetime
+    updated_at: datetime
+    zones: list[ZoneRead] = []
