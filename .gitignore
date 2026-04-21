@@ -20,6 +20,13 @@ server/uploads/*
 player-linux/cache/*
 !player-linux/cache/.gitkeep
 
+player-windows/cache/*
+!player-windows/cache/.gitkeep
+player-windows/build/
+player-windows/dist/
+player-windows/*.dll
+player-windows/*.manifest
+
 .pytest_cache/
 .DS_Store
 .idea/
