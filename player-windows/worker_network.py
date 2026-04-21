@@ -44,7 +44,10 @@ logger = logging.getLogger(__name__)
 # server/routers/websocket.py (``close(code=4404)``) and the
 # ``REDIRECT_STATUS_CODE`` that Starlette returns when a WS is closed
 # before ``accept()`` (HTTP 403 on the handshake).
-WS_UNKNOWN_DEVICE_CLOSE_CODES = (4404,)
+# Server-emitted WebSocket close codes that mean "your credentials are
+# stale; re-register". The handler in ``server/routers/websocket.py``
+# emits 4404 for an unknown device_id and 4401 for a rejected token.
+WS_UNKNOWN_DEVICE_CLOSE_CODES = (4404, 4401)
 
 # Upper bound for the WebSocket reconnect backoff, in seconds. Prevents
 # the player from spamming the server (and the log file) when the
@@ -142,16 +145,38 @@ class NetworkWorker(QObject):
         )
         self._config.device_id = None
         self._config.device_name = None
+        self._config.api_token = None
         try:
             self._config.save()
         except OSError as exc:
             logger.warning("Could not persist cleared config: %s", exc)
 
+    def _auth_headers(self) -> dict[str, str]:
+        """Return the Authorization header for the current device token.
+
+        Kept tiny so we can include it on every outgoing REST call without
+        worrying about ``requests.Session.auth`` semantics interacting
+        badly with the signed download URLs (which carry their own
+        ``?device_id&exp&sig`` credentials).
+        """
+        if not self._config.api_token:
+            return {}
+        return {"Authorization": f"Bearer {self._config.api_token}"}
+
     def _ensure_registered(self) -> None:
-        if self._config.device_id:
+        if self._config.device_id and self._config.api_token:
             self.status_changed.emit("info", f"Device ID: {self._config.device_id}")
             self.registered.emit(self._config.device_id)
             return
+
+        # Missing either id or token ⇒ re-register from scratch. Registration
+        # on a known MAC is idempotent and rotates the token.
+        if self._config.device_id and not self._config.api_token:
+            logger.info(
+                "Have device_id but no api_token; re-registering to acquire one."
+            )
+            self._config.device_id = None
+            self._config.device_name = None
 
         mac = get_mac_address()
         hw_id = get_hardware_id()
@@ -166,6 +191,13 @@ class NetworkWorker(QObject):
                 data = resp.json()
                 self._config.device_id = data["id"]
                 self._config.device_name = data.get("name")
+                token = data.get("api_token")
+                if not token:
+                    raise RuntimeError(
+                        "Server did not return an api_token. Upgrade the "
+                        "CMS to a build that supports per-device tokens."
+                    )
+                self._config.api_token = token
                 self._config.save()
                 self.status_changed.emit("info", f"Registered as {data['name']}")
                 self.registered.emit(self._config.device_id)
@@ -184,15 +216,18 @@ class NetworkWorker(QObject):
         try:
             resp = self._session.get(
                 f"{self._config.server_url}/api/schedule/{self._config.device_id}",
+                headers=self._auth_headers(),
                 timeout=15,
             )
         except requests.RequestException as exc:
             self.status_changed.emit("warn", f"Manifest fetch failed: {exc}")
             return
 
-        if resp.status_code in (403, 404):
-            # The server has never heard of this device_id (or no longer
-            # does). Abort this sync; the outer loop will re-register.
+        if resp.status_code in (401, 403, 404):
+            # 401 ⇒ token rejected (probably rotated in the CMS).
+            # 403 ⇒ legacy server, still means we shouldn't be here.
+            # 404 ⇒ device row deleted.
+            # Every case implies "drop credentials and re-register".
             raise _StaleDeviceError(
                 f"manifest endpoint returned {resp.status_code} for "
                 f"device {self._config.device_id}"
@@ -275,9 +310,16 @@ class NetworkWorker(QObject):
     # ----- WebSocket -----------------------------------------------------
 
     def _run_ws_loop(self) -> None:
-        if not self._config.device_id:
+        if not self._config.device_id or not self._config.api_token:
             return
-        ws_url = f"{self._config.ws_url}/ws/player/{self._config.device_id}"
+        # Token passed on the query string because the WebSocket handshake
+        # cannot carry custom headers from many clients. Safe over TLS.
+        from urllib.parse import quote
+
+        ws_url = (
+            f"{self._config.ws_url}/ws/player/{self._config.device_id}"
+            f"?token={quote(self._config.api_token, safe='')}"
+        )
         backoff = WS_BACKOFF_MIN
         self._ws_requires_reregister = False
 
@@ -385,16 +427,18 @@ def _compact_ws_error(err: Exception | str) -> str:
 
 
 def _is_unknown_device_error(err: Exception | str) -> bool:
-    """Best-effort detector for 'server does not know this device'.
+    """Best-effort detector for "server won't talk to us with these credentials".
 
-    Starlette closes a WebSocket with ``websocket.close()`` before
-    ``accept()``, which the client sees as an HTTP 403 handshake
-    failure. We also accept the proper WebSocket close code 4404 that
-    we emit when the app accepts the handshake but then closes.
+    Covers:
+      * HTTP 403 on the handshake — old server before PR #5 used to close
+        the socket before ``accept()``, which Starlette served as plain 403.
+      * Close code 4404 — server says the device_id is unknown.
+      * Close code 4401 — server says the token is wrong (rotated from CMS).
+    All three call for a re-registration cycle.
     """
     text = str(err)
     if "403" in text and "Handshake" in text:
         return True
-    if "4404" in text:
+    if "4404" in text or "4401" in text:
         return True
     return False

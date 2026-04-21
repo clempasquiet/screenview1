@@ -52,6 +52,9 @@ export const api = {
     return request(`/api/devices/${id}`, { method: 'PATCH', body: JSON.stringify(patch) })
   },
   deleteDevice(id) { return request(`/api/devices/${id}`, { method: 'DELETE' }) },
+  rotateDeviceToken(id) {
+    return request(`/api/devices/${id}/rotate-token`, { method: 'POST' })
+  },
 
   listMedia() { return request('/api/media') },
   uploadMedia(file, default_duration = 10) {

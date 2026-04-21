@@ -5,14 +5,17 @@ import uuid
 from pathlib import Path
 from typing import Annotated
 
+from uuid import UUID
+
 import aiofiles
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile, status
 from fastapi.responses import FileResponse
 from sqlmodel import Session, select
 
 from ..config import settings
 from ..database import get_session
-from ..models import Media, MediaType, ScheduleItem
+from ..device_auth import verify_media_signature
+from ..models import Device, Media, MediaType, ScheduleItem
 from ..schemas import MediaRead, MediaUpdate
 from ..security import require_admin
 from ..utils import guess_media_type, md5_of_file
@@ -136,16 +139,31 @@ def delete_media(
 def download_media(
     media_id: int,
     session: Annotated[Session, Depends(get_session)],
+    device_id: Annotated[UUID, Query(description="Device that the link was signed for")],
+    exp: Annotated[int, Query(description="Expiry (Unix timestamp, seconds)")],
+    sig: Annotated[str, Query(description="HMAC signature")],
 ) -> FileResponse:
-    """Public download endpoint used by players.
+    """Download endpoint used by players.
 
-    Not admin-gated: players use the stable URLs listed in their manifest.
-    Access control relies on the URLs being unguessable via `media_id`
-    sequencing + integrity via MD5; tighten with signed URLs if needed.
+    URLs are pre-signed by ``GET /api/schedule/{device_id}`` using the
+    device's ``api_token`` as the HMAC key. Each URL binds a specific
+    device to a specific media item until a specific expiry timestamp.
+    A leaked URL is therefore:
+
+      * useless after ``exp`` passes,
+      * useless from any other ``device_id``,
+      * invalidated globally if the device's token is rotated.
     """
     media = session.get(Media, media_id)
     if not media:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Media not found")
+
+    device = session.get(Device, device_id)
+    if not device:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Device not registered")
+
+    verify_media_signature(device=device, media_id=media_id, exp=exp, sig=sig)
+
     path = settings.upload_dir / media.filename
     if not path.exists():
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="File missing on disk")

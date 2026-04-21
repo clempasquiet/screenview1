@@ -2,6 +2,7 @@
   "server_url": "http://localhost:8000",
   "device_id": null,
   "device_name": null,
+  "api_token": null,
   "reconnect_delay_seconds": 5,
   "sync_poll_interval_seconds": 60,
   "cache_dir": null,

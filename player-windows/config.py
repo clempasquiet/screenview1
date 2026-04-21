@@ -34,6 +34,11 @@ class PlayerConfig:
     server_url: str = "http://localhost:8000"
     device_id: Optional[str] = None
     device_name: Optional[str] = None
+    # Opaque per-device API token, returned by POST /api/register and
+    # persisted here. Sent back on every subsequent request as
+    # ``Authorization: Bearer <token>``. Rotated transparently by
+    # re-registering after a 401.
+    api_token: Optional[str] = None
     reconnect_delay_seconds: int = 5
     sync_poll_interval_seconds: int = 60
     cache_dir: Optional[str] = None  # None -> APP_DATA_DIR / 'cache'

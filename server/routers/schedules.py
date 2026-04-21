@@ -9,6 +9,11 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlmodel import Session, select
 
 from ..database import get_session
+from ..device_auth import (
+    device_auth_dependency,
+    extract_request_base_url,
+    sign_media_url,
+)
 from ..models import Device, Media, Schedule, ScheduleItem
 from ..schemas import (
     PlaylistManifest,
@@ -155,26 +160,25 @@ async def publish_schedule(
 
 @router.get("/schedule/{device_id}", response_model=PlaylistManifest)
 def get_device_manifest(
-    device_id: UUID,
+    device_id: UUID,  # noqa: ARG001  # used by the auth dependency
     request: Request,
     session: Annotated[Session, Depends(get_session)],
+    device: Annotated[Device, Depends(device_auth_dependency)],
 ) -> PlaylistManifest:
     """Return the JSON manifest a player should cache + download.
 
-    This endpoint is unauthenticated (beyond the `device_id` UUID acting as a
-    shared secret) because players fetch it directly without tokens. Replace
-    with per-device API keys if stricter access control is required.
+    Requires the device's ``api_token`` (Bearer or ``X-Device-Token``).
+    Every download URL in the returned manifest is pre-signed with an
+    HMAC that binds ``device_id`` + ``media_id`` + ``exp`` to the
+    device's token; leaked URLs expire automatically and cannot be
+    replayed from a different device.
     """
-    device = session.get(Device, device_id)
-    if not device:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Device not registered")
-
     schedule: Schedule | None = None
     items: list[PlaylistManifestItem] = []
     if device.current_schedule_id:
         schedule = session.get(Schedule, device.current_schedule_id)
         if schedule:
-            base = str(request.base_url).rstrip("/")
+            base = extract_request_base_url(request)
             for item in sorted(schedule.items, key=lambda i: i.order):
                 media = session.get(Media, item.media_id)
                 if not media:
@@ -185,7 +189,7 @@ def get_device_manifest(
                         order=item.order,
                         type=media.type,
                         original_name=media.original_name,
-                        url=f"{base}/api/media/{media.id}/download",
+                        url=sign_media_url(base, device, media.id),  # type: ignore[arg-type]
                         md5_hash=media.md5_hash,
                         size_bytes=media.size_bytes,
                         duration=item.duration_override or media.default_duration,
