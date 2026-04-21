@@ -132,8 +132,8 @@ def test_ensure_libmpv_no_download_off_windows(fetch_mod, tmp_path, monkeypatch)
 
 
 def test_extract_with_py7zr_used_when_available(fetch_mod, tmp_path, monkeypatch):
-    """If py7zr is installed, we should invoke it before any external
-    extractor. Uses a real .7z archive generated on the fly."""
+    """If py7zr is installed and the archive does not use BCJ2, it
+    should succeed on simple archives. Uses a real .7z generated on the fly."""
     py7zr = pytest.importorskip("py7zr")
 
     # Build a tiny archive containing a single file.
@@ -146,6 +146,96 @@ def test_extract_with_py7zr_used_when_available(fetch_mod, tmp_path, monkeypatch
 
     dest = tmp_path / "out"
     dest.mkdir()
-    assert fetch_mod._extract_archive(archive, dest) is True
+    # Pass persistent_tools_dir=None so we bypass the 7zr bootstrap and
+    # exercise the py7zr + tar fallbacks only.
+    assert fetch_mod._extract_archive(archive, dest, persistent_tools_dir=None) is True
     dll = fetch_mod._find_dll_in_tree(dest)
     assert dll is not None and dll.read_bytes() == b"stub-dll"
+
+
+def test_ensure_libmpv_never_raises(fetch_mod, monkeypatch):
+    """The public entry point must swallow every exception.
+
+    Simulate a completely broken inner helper to prove the outer
+    guard catches anything (not just the expected exception types).
+    """
+    def boom(**kwargs):
+        raise RuntimeError("something went terribly wrong")
+
+    monkeypatch.setattr(fetch_mod, "_ensure_libmpv_inner", boom)
+    # Must not raise.
+    assert fetch_mod.ensure_libmpv(allow_download=True) is None
+
+
+def test_rmtree_best_effort_tolerates_missing_path(fetch_mod, tmp_path):
+    # Must not raise, even though the path doesn't exist.
+    fetch_mod._rmtree_best_effort(tmp_path / "nowhere")
+
+
+def test_rmtree_best_effort_tolerates_locked_files(fetch_mod, tmp_path):
+    # Simulate a partial rmtree failure by pointing shutil.rmtree at a
+    # real directory and patching os.unlink so it always raises.
+    import os as _os
+
+    target = tmp_path / "locked"
+    target.mkdir()
+    (target / "file.bin").write_bytes(b"x")
+
+    # Must not raise.
+    fetch_mod._rmtree_best_effort(target)
+
+
+def test_ensure_7zr_uses_cached_copy(fetch_mod, tmp_path):
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    cached = tools / "7zr.exe"
+    # Write a file big enough to pass the size sanity check.
+    cached.write_bytes(b"MZ" + b"\0" * (fetch_mod.SEVENZR_MIN_SIZE))
+
+    result = fetch_mod._ensure_7zr(tools)
+    assert result == cached
+
+
+def test_ensure_7zr_rejects_tiny_download(fetch_mod, tmp_path, monkeypatch):
+    # Return a tiny blob that fails the size check.
+    monkeypatch.setattr(fetch_mod, "_http_get", lambda url, timeout=30: b"MZ")
+    monkeypatch.setattr(fetch_mod.sys, "platform", "win32")
+    # which() must not find anything.
+    monkeypatch.setattr(fetch_mod.shutil, "which", lambda _name: None)
+
+    tools = tmp_path / "tools"
+    result = fetch_mod._ensure_7zr(tools)
+    assert result is None
+    assert not (tools / "7zr.exe").exists()
+
+
+def test_ensure_7zr_rejects_non_pe_download(fetch_mod, tmp_path, monkeypatch):
+    # Payload is big enough but doesn't start with MZ (not a PE file).
+    bogus = b"X" * (fetch_mod.SEVENZR_MIN_SIZE + 10)
+    monkeypatch.setattr(fetch_mod, "_http_get", lambda url, timeout=30: bogus)
+    monkeypatch.setattr(fetch_mod.sys, "platform", "win32")
+    monkeypatch.setattr(fetch_mod.shutil, "which", lambda _name: None)
+
+    tools = tmp_path / "tools"
+    result = fetch_mod._ensure_7zr(tools)
+    assert result is None
+
+
+def test_ensure_7zr_writes_valid_download(fetch_mod, tmp_path, monkeypatch):
+    payload = b"MZ" + b"\x00" * (fetch_mod.SEVENZR_MIN_SIZE)
+    monkeypatch.setattr(fetch_mod, "_http_get", lambda url, timeout=30: payload)
+    monkeypatch.setattr(fetch_mod.sys, "platform", "win32")
+    monkeypatch.setattr(fetch_mod.shutil, "which", lambda _name: None)
+
+    tools = tmp_path / "tools"
+    result = fetch_mod._ensure_7zr(tools)
+    assert result is not None
+    assert result == tools / "7zr.exe"
+    assert result.read_bytes() == payload
+
+
+def test_ensure_7zr_returns_none_off_windows(fetch_mod, tmp_path, monkeypatch):
+    monkeypatch.setattr(fetch_mod.sys, "platform", "linux")
+    monkeypatch.setattr(fetch_mod.shutil, "which", lambda _name: None)
+    result = fetch_mod._ensure_7zr(tmp_path)
+    assert result is None

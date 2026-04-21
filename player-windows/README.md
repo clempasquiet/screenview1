@@ -18,7 +18,7 @@ the ScreenView server. Only the platform integration differs.
 | Silent subprocesses (WMIC)     | `CREATE_NO_WINDOW` flag                                                         |
 | Packaging                      | PyInstaller single-file GUI `.exe` (`console=False`)                            |
 | Kiosk lockdown                 | Frameless + always-on-top + `BlankCursor`; `Alt+F4`/`Ctrl+W` shortcuts disabled |
-| `libmpv-2.dll` provisioning    | Auto-downloaded on first boot from the official `zhongfly/mpv-winbuild` GitHub release; cached under `%LOCALAPPDATA%\ScreenView\libmpv\` |
+| `libmpv-2.dll` provisioning    | Auto-downloaded from `zhongfly/mpv-winbuild`; extracted using an auto-bootstrapped `7zr.exe` from 7-zip.org (handles BCJ2); cached under `%LOCALAPPDATA%\ScreenView\libmpv\` |
 | Broken media handling          | Render failures are counted per item; after 2 failures the item is skipped for this playlist, and if every item fails the placeholder is shown until a new manifest arrives |
 
 Everything else (registration, manifest diff, MD5 verify, atomic
@@ -32,14 +32,15 @@ with the Linux player.
 - `libmpv-2.dll` (x64) for video playback.
   **The player fetches it automatically on first launch** when it is
   missing, dropping the DLL into `%LOCALAPPDATA%\ScreenView\libmpv\`.
-  The release archive is extracted using **`py7zr`** (pure Python,
-  pinned in `requirements.txt`) — no external 7-Zip install required.
+  Extraction bootstraps the official **`7zr.exe`** (~600 KB, signed) from
+  <https://www.7-zip.org/a/7zr.exe> on first use and caches it next to
+  the DLL. `7zr.exe` handles the **BCJ2** filter used by the mpv release
+  archives, which pure-Python 7z libraries do not support.
   For airgapped kiosks, set `"libmpv_auto_download": false` in
   `config.json` and provide the DLL manually via one of:
   - Drop `libmpv-2.dll` (or `mpv-2.dll`) next to `ScreenViewPlayer.exe`
     or `main.py`.
-  - Run `.\scripts\fetch-libmpv.ps1` once during provisioning
-    (requires 7-Zip on PATH).
+  - Run `.\scripts\fetch-libmpv.ps1` once during provisioning.
   - Set `"libmpv_dir"` in `config.json` to a directory containing the DLL.
 
 ## Run from source (development)
@@ -75,9 +76,10 @@ network, GitHub rate-limit), grab the DLL yourself:
 ```
 
 The script extracts `libmpv-2.dll` from the latest `mpv-dev-x86_64-*.7z`
-release asset and copies it next to the player. It uses
-`tar.exe` (bsdtar, ships with Windows 10 1803+) as the primary
-extractor and falls back to `7z.exe` / `7zr.exe` if on `PATH`.
+release asset and copies it next to the player. If no local `7z.exe` /
+`7zr.exe` is available, it downloads the official standalone `7zr.exe`
+from <https://www.7-zip.org/a/7zr.exe> (signed, ~600 KB) and caches it
+under `%LOCALAPPDATA%\ScreenView\libmpv\` for reuse.
 
 ## Build a standalone `.exe`
 
@@ -202,11 +204,21 @@ few seconds.
 - **HTTPS certificate errors from a self-signed CMS:** install your
   private CA root into the Windows certificate store (or use a proper
   public certificate via Let's Encrypt).
-- **Auto-download of libmpv fails on first boot:** likely a firewall
-  / proxy / rate-limit issue on `api.github.com`. The player still
-  boots (images and widgets work); fetch the DLL manually using
-  `fetch-libmpv.ps1` from a machine with Internet access and copy it
-  into the install dir, or set `"libmpv_dir"` to a UNC path.
+- **Auto-download of libmpv fails on first boot:** likely a firewall,
+  proxy, or rate-limit issue. Hosts the player needs to reach:
+  - `api.github.com` (release metadata)
+  - `objects.githubusercontent.com` (release asset download)
+  - `www.7-zip.org` (bootstrap of `7zr.exe`, only once per machine)
+
+  The player still boots even when all three are blocked — images and
+  widgets keep working, and failures are logged at WARNING level
+  without crashing the UI thread. To fix: fetch the DLL from a machine
+  with Internet access and copy it into the install dir, or set
+  `"libmpv_dir"` in `config.json` to a UNC path.
+- **`BCJ2 filter is not supported by py7zr` in logs:** informational
+  only. The current mpv release archives use BCJ2 and `py7zr` cannot
+  decode them. The player falls back to the bootstrapped `7zr.exe`
+  automatically; no action needed.
 - **Repeated WebSocket 403 / 4404 in the log:** the server doesn't
   know this device. Normally self-healed by automatic re-registration;
   if it persists, delete `%LOCALAPPDATA%\ScreenView\config.json` and

@@ -9,11 +9,13 @@
   the parent of this script (so it ends up next to main.py and the
   .spec file).
 
-  The script uses `tar.exe` (bsdtar, ships with Windows 10 1803+ and
-  handles .7z via libarchive) as the primary extractor and falls back
-  to 7z.exe or 7zr.exe if they are on PATH.
+  The mpv release archives use the BCJ2 filter (LZMA optimised for
+  binaries) which plain ``tar.exe`` / ``py7zr`` cannot decompress,
+  so the script bootstraps the official standalone ``7zr.exe`` from
+  https://www.7-zip.org/a/7zr.exe (~600 KB, signed by Igor Pavlov)
+  on first use and caches it alongside the DLL for future runs.
 
-  Re-run it periodically to pick up newer mpv builds.
+  Re-run the script periodically to pick up newer mpv builds.
 
 .PARAMETER TargetDir
   Directory to copy libmpv-2.dll into. Defaults to the project root.
@@ -39,22 +41,54 @@ $ProgressPreference = "SilentlyContinue"  # Invoke-WebRequest is ~10x faster wit
 
 $projectRoot = Split-Path -Parent $PSScriptRoot
 if (-not $TargetDir) { $TargetDir = $projectRoot }
+$toolsDir = Join-Path $env:LOCALAPPDATA "ScreenView\libmpv"
+if (-not (Test-Path -LiteralPath $toolsDir)) {
+    New-Item -ItemType Directory -Path $toolsDir -Force | Out-Null
+}
 
 Write-Host "ScreenView :: libmpv fetcher"
 Write-Host "  Target dir : $TargetDir"
 Write-Host "  Variant    : $Variant"
+Write-Host "  Tools dir  : $toolsDir"
+
+$headers = @{ "User-Agent" = "screenview-player-installer" }
 
 # ---------------------------------------------------------------------------
-# 1. Resolve the latest release asset URL from the GitHub API.
+# 1. Make sure we have a working 7zr.exe.
+# ---------------------------------------------------------------------------
+function Get-SevenZr {
+    $cached = Join-Path $toolsDir "7zr.exe"
+    if ((Test-Path -LiteralPath $cached) -and ((Get-Item $cached).Length -gt 100KB)) {
+        return $cached
+    }
+    foreach ($exe in @("7zr.exe", "7z.exe")) {
+        $cmd = Get-Command $exe -ErrorAction SilentlyContinue
+        if ($cmd) { return $cmd.Source }
+    }
+    Write-Host "Bootstrapping 7zr.exe from https://www.7-zip.org/a/7zr.exe …"
+    Invoke-WebRequest -Uri "https://www.7-zip.org/a/7zr.exe" -OutFile $cached -Headers $headers -TimeoutSec 60
+    $size = (Get-Item $cached).Length
+    if ($size -lt 100KB -or $size -gt 10MB) {
+        Remove-Item -LiteralPath $cached -ErrorAction SilentlyContinue
+        throw "Downloaded 7zr.exe has unexpected size ($size bytes); aborting."
+    }
+    $magic = [System.IO.File]::ReadAllBytes($cached)[0..1]
+    if ($magic[0] -ne 0x4D -or $magic[1] -ne 0x5A) {
+        Remove-Item -LiteralPath $cached -ErrorAction SilentlyContinue
+        throw "Downloaded 7zr.exe is not a PE executable (magic=$($magic -join ',')); aborting."
+    }
+    return $cached
+}
+
+$sevenZr = Get-SevenZr
+Write-Host "Using extractor: $sevenZr"
+
+# ---------------------------------------------------------------------------
+# 2. Resolve the latest mpv-dev release asset URL.
 # ---------------------------------------------------------------------------
 $apiUrl = "https://api.github.com/repos/zhongfly/mpv-winbuild/releases/latest"
 Write-Host "Querying $apiUrl …"
-$headers = @{ "User-Agent" = "screenview-player-installer" }
-try {
-    $release = Invoke-RestMethod -Uri $apiUrl -Headers $headers -TimeoutSec 30
-} catch {
-    throw "Failed to query GitHub: $($_.Exception.Message)"
-}
+$release = Invoke-RestMethod -Uri $apiUrl -Headers $headers -TimeoutSec 30
 
 $pattern = "mpv-dev-$Variant-*.7z"
 $asset = $release.assets | Where-Object { $_.name -like $pattern } | Select-Object -First 1
@@ -64,7 +98,7 @@ if (-not $asset) {
 Write-Host "Selected asset: $($asset.name) ($([math]::Round($asset.size/1MB, 1)) MB)"
 
 # ---------------------------------------------------------------------------
-# 2. Download to a temp location.
+# 3. Download + extract + copy.
 # ---------------------------------------------------------------------------
 $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("screenview-libmpv-" + [Guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $tempRoot -Force | Out-Null
@@ -72,54 +106,18 @@ try {
     $archive = Join-Path $tempRoot $asset.name
     Write-Host "Downloading …"
     Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $archive -Headers $headers -TimeoutSec 300
-    Write-Host "Downloaded $archive"
 
-    # -----------------------------------------------------------------------
-    # 3. Extract the archive.
-    # -----------------------------------------------------------------------
     $extractDir = Join-Path $tempRoot "extracted"
     New-Item -ItemType Directory -Path $extractDir -Force | Out-Null
 
-    $extractors = @(
-        @{ Exe = (Get-Command "7z.exe" -ErrorAction SilentlyContinue);  Args = @("x", "-y", "-o$extractDir", $archive) },
-        @{ Exe = (Get-Command "7zr.exe" -ErrorAction SilentlyContinue); Args = @("x", "-y", "-o$extractDir", $archive) },
-        @{ Exe = (Get-Command "tar.exe" -ErrorAction SilentlyContinue); Args = @("-xf", $archive, "-C", $extractDir) }
-    )
-
-    $extracted = $false
-    foreach ($ex in $extractors) {
-        if (-not $ex.Exe) { continue }
-        Write-Host "Extracting with $($ex.Exe.Source) …"
-        try {
-            & $ex.Exe.Source @($ex.Args) | Out-Null
-            if ($LASTEXITCODE -eq 0) {
-                $extracted = $true
-                break
-            } else {
-                Write-Warning "$($ex.Exe.Name) exited with code $LASTEXITCODE; trying next extractor."
-            }
-        } catch {
-            Write-Warning "Extraction with $($ex.Exe.Name) failed: $($_.Exception.Message)"
-        }
+    Write-Host "Extracting with $sevenZr …"
+    & $sevenZr x "-o$extractDir" "-y" $archive | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "7zr.exe exited with code $LASTEXITCODE"
     }
 
-    if (-not $extracted) {
-        throw @"
-Could not extract the .7z archive with any external tool.
-Install 7-Zip from https://www.7-zip.org/ (recommended) and re-run this
-script. Alternatively, the Python player itself ships a pure-Python
-extractor (py7zr) that avoids this problem entirely — run
-`python main.py` once with an internet connection to have the player
-self-provision libmpv-2.dll under %LOCALAPPDATA%\ScreenView\libmpv\.
-"@
-    }
-
-    # -----------------------------------------------------------------------
-    # 4. Copy libmpv-2.dll into place.
-    # -----------------------------------------------------------------------
     $dll = Get-ChildItem -Path $extractDir -Filter "libmpv-2.dll" -Recurse -File | Select-Object -First 1
     if (-not $dll) {
-        # Some archives ship it as mpv-2.dll; python-mpv accepts either.
         $dll = Get-ChildItem -Path $extractDir -Filter "mpv-2.dll" -Recurse -File | Select-Object -First 1
     }
     if (-not $dll) {
