@@ -19,18 +19,39 @@ Windows-specific adaptations vs. the Linux player:
 from __future__ import annotations
 
 import logging
+import os
 import signal
 import sys
 from logging.handlers import RotatingFileHandler
+from pathlib import Path
 
-from PyQt6.QtCore import Qt
-from PyQt6.QtWidgets import QApplication
+# Anchor the process's working directory to the script location *before*
+# importing any PyQt / mpv modules. Task Scheduler launches processes
+# with ``CWD=C:\Windows\System32``, which would otherwise cause:
+#   * Qt to write ``QtWebEngineProcess.exe``-relative caches in System32,
+#   * mpv to miss any ``mpv.conf`` / ``scripts/`` sitting next to the exe,
+#   * any relative path accidentally escaping our own resolution helpers
+#     to land somewhere unwritable.
+# Having a stable CWD is cheap insurance. Our own code still uses
+# absolute paths everywhere (see ``config.resolve_app_path``) — the
+# chdir is belt-and-braces for third-party libraries.
+_APP_DIR = Path(__file__).resolve().parent
+try:
+    os.chdir(_APP_DIR)
+except OSError:
+    # Read-only mount, exotic filesystem, etc. — logging not yet
+    # configured, so we stay silent. Our own path resolution doesn't
+    # rely on CWD anyway.
+    pass
 
-from config import PlayerConfig
-from player_ui import PlayerWindow
-from power import enable_dpi_awareness, prevent_display_sleep, restore_power_state
-from single_instance import SingleInstance
-from worker_network import start_in_thread
+from PyQt6.QtCore import Qt  # noqa: E402  # after chdir
+from PyQt6.QtWidgets import QApplication  # noqa: E402
+
+from config import PlayerConfig  # noqa: E402
+from player_ui import PlayerWindow  # noqa: E402
+from power import enable_dpi_awareness, prevent_display_sleep, restore_power_state  # noqa: E402
+from single_instance import SingleInstance  # noqa: E402
+from worker_network import start_in_thread  # noqa: E402
 
 
 def _configure_logging(config: PlayerConfig) -> None:
@@ -76,10 +97,13 @@ def main() -> int:
         app.setApplicationName("ScreenView Player")
         app.setQuitOnLastWindowClosed(True)
 
+        # Feed the resolved libmpv dir (anchored to APP_DIR, never CWD)
+        # rather than the raw config string.
+        resolved_libmpv = config.libmpv_search_dir
         window = PlayerWindow(
             fullscreen=config.fullscreen,
             show_cursor=config.show_cursor,
-            libmpv_dir=config.libmpv_dir,
+            libmpv_dir=str(resolved_libmpv) if resolved_libmpv else None,
             libmpv_app_data_dir=config.app_data_dir,
             libmpv_auto_download=config.libmpv_auto_download,
         )
