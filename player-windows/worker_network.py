@@ -70,13 +70,13 @@ WS_BACKOFF_JITTER = 0.2  # fraction of the nominal delay
 
 
 @dataclass
-class PlaylistEntry:
-    """Resolved playlist item.
+class ZoneItem:
+    """One media item attached to a Zone after cache resolution.
 
     For ``kind in {'video', 'image', 'widget'}`` ``path`` points at a
-    locally cached, MD5-validated file. For ``kind == 'stream'`` there
-    is no local copy: ``path`` is ``None`` and ``stream_url`` carries
-    the upstream URL that ``libmpv`` will open directly.
+    locally cached, MD5-validated file. For ``kind == 'stream'``
+    there is no local copy: ``path`` is ``None`` and ``stream_url``
+    carries the upstream URL that libmpv opens directly.
     """
 
     media_id: int
@@ -84,11 +84,78 @@ class PlaylistEntry:
     path: Optional[Path]
     duration: int
     original_name: str
+    order: int = 0
+    mime_type: Optional[str] = None
     stream_url: Optional[str] = None
 
     @property
     def is_stream(self) -> bool:
         return self.kind == "stream"
+
+
+@dataclass
+class Zone:
+    """A rectangular region inside a Slide's layout.
+
+    Geometry is in the layout's authoring coordinate space (pixels).
+    The player scales the whole layout to its actual screen size
+    with ``object-fit: contain`` semantics, so the same layout
+    renders identically on 1080p and 4K displays (with letter-
+    or pillar-boxing where aspect ratios differ).
+    """
+
+    zone_id: Optional[int]
+    name: str
+    position_x: int
+    position_y: int
+    width: int
+    height: int
+    z_index: int
+    items: list[ZoneItem]
+
+
+@dataclass
+class Slide:
+    """One slot in the device's schedule: a layout + its total
+    on-screen duration.
+
+    ``slide_id`` is a stable (across manifest refreshes) string the
+    worker + UI can use for logging / diffing. ``duration`` is the
+    TOTAL time the slide stays on screen, which replaces the
+    per-entry duration of the pre-Phase-2 flat manifest.
+
+    Legacy single-media slots show up here as a synthetic layout
+    with ``layout_id=None`` and a single full-canvas zone. The UI
+    does not need to special-case them.
+    """
+
+    slide_id: str
+    order: int
+    duration: int
+    layout_id: Optional[int]
+    layout_name: str
+    resolution_w: int
+    resolution_h: int
+    zones: list[Zone]
+
+    # ---- convenience predicates used by the UI dispatcher ----
+
+    @property
+    def has_video(self) -> bool:
+        """True if any zone has a video or stream item in its playlist."""
+        return any(
+            any(i.kind in ("video", "stream") for i in z.items) for z in self.zones
+        )
+
+    def first_video_item(self) -> Optional[ZoneItem]:
+        """Return the first video/stream ZoneItem encountered walking
+        zones in layout (z_index) order. Used by the UI when a mixed
+        layout has to fall back to fullscreen-video mode."""
+        for zone in self.zones:
+            for item in zone.items:
+                if item.kind in ("video", "stream"):
+                    return item
+        return None
 
 
 class _StaleDeviceError(RuntimeError):
@@ -98,12 +165,37 @@ class _StaleDeviceError(RuntimeError):
     """
 
 
+class _CacheError(RuntimeError):
+    """Raised when caching (download + MD5 verify) of a single item
+    fails and the sync should be aborted.
+
+    We abort the whole sync rather than emitting a partial playlist
+    so the UI keeps playing its last known-good tree rather than
+    flickering through half-resolved slides.
+    """
+
+
+@dataclass
+class _Progress:
+    """Tiny mutable counter + emitter used by ``_sync`` to report
+    per-item progress without passing awkward ref-containers around.
+    """
+
+    done: int
+    total: int
+    emit: Any  # ``pyqtBoundSignal.emit`` — duck-typed for testability
+
+    def tick(self) -> None:
+        self.done += 1
+        self.emit(self.done, self.total)
+
+
 class NetworkWorker(QObject):
     """Runs inside a QThread; orchestrates all I/O."""
 
     registered = pyqtSignal(str)  # device_id
     status_changed = pyqtSignal(str, str)  # level, message
-    playlist_ready = pyqtSignal(list)  # list[PlaylistEntry]
+    playlist_ready = pyqtSignal(list)  # list[Slide]
     sync_progress = pyqtSignal(int, int)  # done, total
 
     def __init__(self, config: PlayerConfig) -> None:
@@ -261,67 +353,52 @@ class NetworkWorker(QObject):
             self.status_changed.emit("warn", f"Manifest fetch failed: {exc}")
             return
 
-        items = manifest.get("items") or []
-        if not items:
+        slides_raw = manifest.get("slides") or []
+        if not slides_raw:
             self.status_changed.emit("info", "No schedule assigned yet.")
             self.playlist_ready.emit([])
             return
 
-        self.status_changed.emit("info", f"Syncing {len(items)} item(s)…")
-        resolved: list[PlaylistEntry] = []
-        total = len(items)
-        for idx, item in enumerate(items):
-            kind = item.get("type")
-            # Live streams skip the cache + MD5 pipeline entirely; the
-            # URL is opened directly by libmpv at play time. They are
-            # the documented exception to the offline-first guarantee:
-            # if the network is down at play time the player just shows
-            # the placeholder for that item and moves on.
-            if kind == "stream":
-                stream_url = item.get("url")
-                if not stream_url:
-                    self.status_changed.emit(
-                        "warn", f"Stream item missing URL: {item.get('original_name')}"
-                    )
-                    continue
-                resolved.append(
-                    PlaylistEntry(
-                        media_id=item["media_id"],
-                        kind="stream",
-                        path=None,
-                        duration=int(item.get("duration") or 30),
-                        original_name=item.get("original_name") or "Live stream",
-                        stream_url=stream_url,
-                    )
-                )
-                self.sync_progress.emit(idx + 1, total)
-                continue
+        # Count every media in every zone of every slide so the
+        # progress bar reflects the real cache work, not just the
+        # slide count.
+        total_items = sum(
+            len(zone.get("items") or [])
+            for slide in slides_raw
+            for zone in (slide.get("layout", {}).get("zones") or [])
+        )
+        self.status_changed.emit(
+            "info",
+            f"Syncing {len(slides_raw)} slide(s), {total_items} media item(s)…",
+        )
 
-            try:
-                local_path = self._ensure_cached(item)
-            except Exception as exc:  # noqa: BLE001
-                logger.exception("Failed to cache %s", item)
-                self.status_changed.emit(
-                    "warn", f"Failed to cache {item.get('original_name')}: {exc}"
-                )
-                # Abort the whole sync; a partial playlist would be worse than
-                # keeping the last known-good one cached on the UI side.
-                return
-            resolved.append(
-                PlaylistEntry(
-                    media_id=item["media_id"],
-                    kind=kind,
-                    path=local_path,
-                    duration=int(item.get("duration") or 10),
-                    original_name=item.get("original_name") or local_path.name,
-                )
+        resolved_slides: list[Slide] = []
+        cached_names: set[str] = set()
+        progress = _Progress(done=0, total=total_items, emit=self.sync_progress.emit)
+
+        try:
+            for slide_raw in slides_raw:
+                slide = self._resolve_slide(slide_raw, progress=progress)
+                resolved_slides.append(slide)
+                for zone in slide.zones:
+                    for item in zone.items:
+                        if item.path is not None:
+                            cached_names.add(item.path.name)
+        except _CacheError as exc:
+            # _resolve_slide raises this on any cache failure. Abort
+            # the whole sync so we never emit a partial playlist.
+            logger.exception("Caching aborted: %s", exc)
+            self.status_changed.emit(
+                "warn",
+                f"Sync aborted: {exc}. Keeping the previous playlist.",
             )
-            self.sync_progress.emit(idx + 1, total)
+            return
 
-        # Stream entries have no on-disk file; only keep file-backed names.
-        self._cleanup_cache(keep={e.path.name for e in resolved if e.path is not None})
+        # Every file-backed ZoneItem across the whole tree must be kept.
+        # Stream items have no on-disk file.
+        self._cleanup_cache(keep=cached_names)
         self.status_changed.emit("info", "Sync complete — swapping playlist.")
-        self.playlist_ready.emit(resolved)
+        self.playlist_ready.emit(resolved_slides)
 
     def _ensure_cached(self, item: dict[str, Any]) -> Path:
         md5 = item["md5_hash"]
@@ -346,6 +423,106 @@ class NetworkWorker(QObject):
         # os.replace is atomic on the same volume (NTFS on Windows, ext* on Linux).
         tmp.replace(dest)
         return dest
+
+    def _resolve_zone_item(
+        self,
+        raw: dict[str, Any],
+        progress: _Progress,
+    ) -> ZoneItem | None:
+        """Download + MD5-verify a single zone item, return it resolved.
+
+        Streams bypass the cache pipeline (the upstream URL is carried
+        through verbatim). Any failure raises :class:`_CacheError` so
+        the caller can abort the whole sync cleanly.
+
+        Returns ``None`` and logs a warning for items whose manifest
+        entry is malformed (e.g. ``type="stream"`` with no URL); the
+        slide keeps going without that one item.
+        """
+        kind = raw.get("type")
+        media_id = raw.get("media_id")
+        if media_id is None:
+            logger.warning("Zone item missing media_id; skipping: %s", raw)
+            return None
+
+        if kind == "stream":
+            stream_url = raw.get("url")
+            if not stream_url:
+                self.status_changed.emit(
+                    "warn", f"Stream item missing URL: {raw.get('original_name')}"
+                )
+                progress.tick()
+                return None
+            progress.tick()
+            return ZoneItem(
+                media_id=int(media_id),
+                kind="stream",
+                path=None,
+                duration=int(raw.get("duration") or 30),
+                original_name=raw.get("original_name") or "Live stream",
+                order=int(raw.get("order") or 0),
+                mime_type=raw.get("mime_type"),
+                stream_url=stream_url,
+            )
+
+        try:
+            local_path = self._ensure_cached(raw)
+        except Exception as exc:  # noqa: BLE001
+            raise _CacheError(
+                f"failed to cache {raw.get('original_name')!r} (media_id={media_id}): {exc}"
+            ) from exc
+
+        progress.tick()
+        return ZoneItem(
+            media_id=int(media_id),
+            kind=str(kind or "image"),
+            path=local_path,
+            duration=int(raw.get("duration") or 10),
+            original_name=raw.get("original_name") or local_path.name,
+            order=int(raw.get("order") or 0),
+            mime_type=raw.get("mime_type"),
+        )
+
+    def _resolve_zone(self, raw: dict[str, Any], progress: _Progress) -> Zone:
+        """Materialise one zone: geometry + resolved items."""
+        items_raw = raw.get("items") or []
+        resolved_items: list[ZoneItem] = []
+        for item_raw in items_raw:
+            item = self._resolve_zone_item(item_raw, progress)
+            if item is not None:
+                resolved_items.append(item)
+        return Zone(
+            zone_id=raw.get("zone_id"),
+            name=str(raw.get("name") or "Zone"),
+            position_x=int(raw.get("position_x") or 0),
+            position_y=int(raw.get("position_y") or 0),
+            width=int(raw.get("width") or 1920),
+            height=int(raw.get("height") or 1080),
+            z_index=int(raw.get("z_index") or 0),
+            items=resolved_items,
+        )
+
+    def _resolve_slide(self, raw: dict[str, Any], progress: _Progress) -> Slide:
+        """Materialise one slide (layout + zones + items).
+
+        Every zone item is downloaded and MD5-verified **before** the
+        slide is returned. On any cache failure :class:`_CacheError`
+        propagates up and the caller aborts the whole sync.
+        """
+        layout = raw.get("layout") or {}
+        zones_raw = layout.get("zones") or []
+        resolved_zones = [self._resolve_zone(zr, progress) for zr in zones_raw]
+
+        return Slide(
+            slide_id=str(raw.get("slide_id") or f"slide:{raw.get('order', 0)}"),
+            order=int(raw.get("order") or 0),
+            duration=int(raw.get("duration") or 10),
+            layout_id=layout.get("layout_id"),
+            layout_name=str(layout.get("name") or "Layout"),
+            resolution_w=int(layout.get("resolution_w") or 1920),
+            resolution_h=int(layout.get("resolution_h") or 1080),
+            zones=resolved_zones,
+        )
 
     def _cleanup_cache(self, keep: set[str]) -> None:
         for entry in self._cache_dir.iterdir():
