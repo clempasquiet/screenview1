@@ -336,13 +336,25 @@ def test_manifest_requires_token_and_returns_signed_urls(client: TestClient) -> 
     anon = client.get(f"/api/schedule/{device_id}")
     assert anon.status_code == 401
 
-    # Correct token → manifest with a signed URL.
+    # Correct token → Layout-tree manifest with a signed URL.
     manifest = client.get(f"/api/schedule/{device_id}", headers=_device_auth(token))
     assert manifest.status_code == 200, manifest.text
     data = manifest.json()
     assert data["schedule_id"] == schedule_id
-    item = data["items"][0]
-    assert item["duration"] == 7
+    # One slide — a legacy single-media slot wrapped in a synthetic
+    # full-screen layout (layout_id is None).
+    assert len(data["slides"]) == 1
+    slide = data["slides"][0]
+    assert slide["duration"] == 7
+    layout = slide["layout"]
+    assert layout["layout_id"] is None, "legacy media slot must produce a synthetic layout"
+    assert len(layout["zones"]) == 1
+    zone = layout["zones"][0]
+    assert zone["zone_id"] is None, "synthetic zones carry zone_id=None"
+    assert zone["position_x"] == 0 and zone["position_y"] == 0
+    assert zone["width"] == layout["resolution_w"]
+    assert zone["height"] == layout["resolution_h"]
+    item = zone["items"][0]
     assert "device_id=" in item["url"]
     assert "exp=" in item["url"]
     assert "sig=" in item["url"]
@@ -439,7 +451,8 @@ def test_signed_url_rejected_from_other_device(client: TestClient) -> None:
         f"/api/schedule/{alice['id']}",
         headers=_device_auth(alice["api_token"]),
     ).json()
-    alice_url = manifest["items"][0]["url"]
+    # Walk the tree to the first (synthetic) zone item.
+    alice_url = manifest["slides"][0]["layout"]["zones"][0]["items"][0]["url"]
 
     # Bob cannot replay Alice's URL: the signature binds ``device_id=alice``.
     # Substituting bob's device_id with alice's signature must fail.
@@ -740,7 +753,10 @@ def test_stream_appears_in_player_manifest_with_upstream_url(client: TestClient)
         f"/api/schedule/{device_id}", headers=_device_auth(token)
     )
     assert manifest.status_code == 200
-    item = manifest.json()["items"][0]
+    # Stream slot → synthetic full-screen layout with one zone item.
+    slide = manifest.json()["slides"][0]
+    assert slide["layout"]["layout_id"] is None  # synthetic
+    item = slide["layout"]["zones"][0]["items"][0]
     # The upstream URL is passed through verbatim — no signature, no
     # device binding, no expiry. md5/size are zeroed out so the player
     # knows to skip the cache pipeline.

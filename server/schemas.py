@@ -338,3 +338,112 @@ class LayoutRead(BaseModel):
     created_at: datetime
     updated_at: datetime
     zones: list[ZoneRead] = []
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 Step 4 — Layout-tree manifest (what players download)
+# ---------------------------------------------------------------------------
+#
+# The player manifest is no longer a flat list of media. It is a tree:
+#
+#     LayoutManifest
+#     └── slides: list[ManifestSlide]
+#          ├── slide metadata (id, order, duration)
+#          └── layout: ManifestLayout
+#                ├── layout metadata (name, resolution)
+#                └── zones: list[ManifestZone]
+#                      ├── geometry (x, y, w, h, z_index)
+#                      └── items: list[ManifestZoneItem]
+#                            (media_id, type, url, md5, size, duration)
+#
+# Legacy single-media ``ScheduleItem`` rows (``media_id`` set,
+# ``layout_id`` NULL) are wrapped server-side in a *synthetic*
+# one-zone-fullscreen layout so the player has a single uniform shape
+# to parse. The worker + UI never sees the legacy/new distinction.
+
+
+class ManifestZoneItem(BaseModel):
+    """One media item inside a Zone's playlist.
+
+    For ``MediaType.stream`` items, ``url`` is the upstream URL and
+    ``md5_hash`` / ``size_bytes`` are empty — the player skips the
+    download + verify pipeline for streams and hands the URL straight
+    to libmpv.
+    """
+
+    media_id: int
+    order: int
+    type: MediaType
+    original_name: str
+    mime_type: Optional[str] = None
+    url: str
+    md5_hash: str = ""
+    size_bytes: int = 0
+    duration: int
+
+
+class ManifestZone(BaseModel):
+    """A rectangular region inside a slide's layout.
+
+    Coordinates are in the layout's **authoring resolution** (see
+    :class:`ManifestLayout`); the player scales the whole layout to
+    its actual screen size with ``object-fit: contain`` semantics.
+    ``zone_id`` is ``None`` for synthetic zones (legacy single-media
+    slots wrapped on the fly); otherwise it's the DB row id and stays
+    stable across manifest refreshes.
+    """
+
+    zone_id: Optional[int] = None
+    name: str
+    position_x: int
+    position_y: int
+    width: int
+    height: int
+    z_index: int = 0
+    items: list[ManifestZoneItem] = []
+
+
+class ManifestLayout(BaseModel):
+    """The canvas for one slide.
+
+    ``layout_id`` is ``None`` for synthetic layouts (see above).
+    """
+
+    layout_id: Optional[int] = None
+    name: str
+    resolution_w: int
+    resolution_h: int
+    zones: list[ManifestZone] = []
+
+
+class ManifestSlide(BaseModel):
+    """One slot in the device's schedule.
+
+    Each slide corresponds to one row in the ``schedule_item`` table.
+    ``slide_id`` is a human-readable identifier the player can use
+    for cache keying or logging, stable across manifest refreshes.
+    ``duration`` is the **total** time this slide stays on screen,
+    replacing the per-media duration of the legacy flat manifest.
+    """
+
+    slide_id: str
+    order: int
+    duration: int
+    layout: ManifestLayout
+
+
+class LayoutManifest(BaseModel):
+    """Tree-shaped manifest for Phase 2 Step 4 and beyond.
+
+    Replaces the flat :class:`PlaylistManifest` returned by
+    ``GET /api/schedule/{device_id}``. The player stores this
+    locally, diffs it against its cache, downloads every media in
+    every zone of every slide, MD5-verifies each, and only then
+    swaps the active playlist in the UI thread.
+    """
+
+    device_id: UUID
+    schedule_id: Optional[int]
+    schedule_name: Optional[str]
+    generated_at: datetime
+    slides: list[ManifestSlide] = []
