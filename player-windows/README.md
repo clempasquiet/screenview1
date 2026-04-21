@@ -18,6 +18,8 @@ the ScreenView server. Only the platform integration differs.
 | Silent subprocesses (WMIC)     | `CREATE_NO_WINDOW` flag                                                         |
 | Packaging                      | PyInstaller single-file GUI `.exe` (`console=False`)                            |
 | Kiosk lockdown                 | Frameless + always-on-top + `BlankCursor`; `Alt+F4`/`Ctrl+W` shortcuts disabled |
+| `libmpv-2.dll` provisioning    | Auto-downloaded on first boot from the official `zhongfly/mpv-winbuild` GitHub release; cached under `%LOCALAPPDATA%\ScreenView\libmpv\` |
+| Broken media handling          | Render failures are counted per item; after 2 failures the item is skipped for this playlist, and if every item fails the placeholder is shown until a new manifest arrives |
 
 Everything else (registration, manifest diff, MD5 verify, atomic
 playlist swap, offline loop, placeholder frame) is shared line-for-line
@@ -28,10 +30,14 @@ with the Linux player.
 - Windows 10 1903 or later (Windows 11 recommended for best WebView2).
 - Python 3.10–3.12 (only needed for source runs or PyInstaller builds).
 - `libmpv-2.dll` (x64) for video playback.
-  - Download a recent release from <https://sourceforge.net/projects/mpv-player-windows/files/libmpv/>
+  **The player fetches it automatically on first launch** when it is
+  missing, dropping the DLL into `%LOCALAPPDATA%\ScreenView\libmpv\`.
+  For airgapped kiosks, set `"libmpv_auto_download": false` in
+  `config.json` and provide the DLL manually via one of:
   - Drop `libmpv-2.dll` (or `mpv-2.dll`) next to `ScreenViewPlayer.exe`
-    (or next to `main.py` for source runs). The player can also resolve
-    it from a user-configured directory via `config.libmpv_dir`.
+    or `main.py`.
+  - Run `.\scripts\fetch-libmpv.ps1` once during provisioning.
+  - Set `"libmpv_dir"` in `config.json` to a directory containing the DLL.
 
 ## Run from source (development)
 
@@ -47,22 +53,42 @@ python main.py
 
 On first launch the player auto-registers with the server
 (`POST /api/register`) and shows a branded placeholder until an
-administrator approves it and assigns a schedule in the CMS.
+administrator approves it and assigns a schedule in the CMS. If
+`libmpv-2.dll` is missing, the first boot also downloads it
+automatically (a one-off ~30 MB fetch from the official
+[zhongfly/mpv-winbuild](https://github.com/zhongfly/mpv-winbuild)
+release). The DLL is cached under
+`%LOCALAPPDATA%\ScreenView\libmpv\` and reused on subsequent launches.
+
+### Fetch libmpv manually
+
+If auto-download is disabled or fails (corporate proxy, air-gapped
+network, GitHub rate-limit), grab the DLL yourself:
+
+```powershell
+.\scripts\fetch-libmpv.ps1
+# Or target a specific directory:
+.\scripts\fetch-libmpv.ps1 -TargetDir "C:\Program Files\ScreenView"
+```
+
+The script extracts `libmpv-2.dll` from the latest `mpv-dev-x86_64-*.7z`
+release asset and copies it next to the player. It uses
+`tar.exe` (bsdtar, ships with Windows 10 1803+) as the primary
+extractor and falls back to `7z.exe` / `7zr.exe` if on `PATH`.
 
 ## Build a standalone `.exe`
 
 ```powershell
 cd player-windows
 
-# Put libmpv-2.dll here first so PyInstaller bundles it.
-Copy-Item C:\path\to\libmpv-2.dll .
-
 .\scripts\build.ps1
 # -> dist\ScreenViewPlayer.exe
 ```
 
-The resulting executable is self-contained; copy it to
-`C:\Program Files\ScreenView\` (or anywhere else) on the target kiosk.
+The build script automatically invokes `fetch-libmpv.ps1` when
+`libmpv-2.dll` is not already in the project root, so the resulting
+executable is self-contained. Copy it to `C:\Program Files\ScreenView\`
+(or anywhere else) on the target kiosk.
 
 ## Install as a kiosk (Task Scheduler)
 
@@ -125,9 +151,16 @@ For a truly infallible kiosk we recommend, in addition to the player:
 
 ## Troubleshooting
 
-- **Black / placeholder screen on videos:** `libmpv-2.dll` missing or
-  mismatched architecture. Download the x64 build and place it next to
-  the exe, or set `"libmpv_dir"` in `config.json`.
+- **"Content unavailable" placeholder on video items:** `libmpv-2.dll`
+  is missing or mismatched. The player no longer burns a CPU core
+  retrying a broken item — it skips past it, and if every item in the
+  playlist fails it holds on the placeholder until a new manifest
+  arrives. To resolve:
+  - Run `.\scripts\fetch-libmpv.ps1` manually, or
+  - Confirm auto-download worked by checking
+    `%LOCALAPPDATA%\ScreenView\libmpv\libmpv-2.dll`, or
+  - Ensure `"libmpv_auto_download": true` in `config.json` and that
+    the kiosk can reach `api.github.com` / `objects.githubusercontent.com`.
 - **Stuck in "Waiting for schedule…":** the device is still `pending`
   approval in the CMS. Approve it and assign a schedule.
 - **Duplicate windows after logon:** a previous process is still alive.
@@ -136,6 +169,11 @@ For a truly infallible kiosk we recommend, in addition to the player:
 - **HTTPS certificate errors from a self-signed CMS:** install your
   private CA root into the Windows certificate store (or use a proper
   public certificate via Let's Encrypt).
+- **Auto-download of libmpv fails on first boot:** likely a firewall
+  / proxy / rate-limit issue on `api.github.com`. The player still
+  boots (images and widgets work); fetch the DLL manually using
+  `fetch-libmpv.ps1` from a machine with Internet access and copy it
+  into the install dir, or set `"libmpv_dir"` to a UNC path.
 
 ## Tests
 

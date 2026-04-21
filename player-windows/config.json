@@ -8,5 +8,6 @@
   "fullscreen": true,
   "show_cursor": false,
   "prevent_display_sleep": true,
-  "libmpv_dir": null
+  "libmpv_dir": null,
+  "libmpv_auto_download": true
 }
