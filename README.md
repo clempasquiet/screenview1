@@ -13,19 +13,23 @@ background.
 └───────▲───────┘                         └────────▲─────────┘
         │REST (admin)                              │REST (manifest + downloads)
         │                                          │WebSocket (sync triggers)
-        │                                   ┌──────┴──────────┐
-        │                                   │ Player (PyQt6)  │
-        │                                   │ /player-linux   │
-        │                                   └─────────────────┘
+        │                              ┌───────────┴───────────┐
+        │                              │                       │
+        │                    ┌─────────┴─────────┐   ┌─────────┴──────────┐
+        │                    │  Player (Linux)   │   │ Player (Windows)   │
+        │                    │   PyQt6 + mpv     │   │   PyQt6 + mpv      │
+        │                    │  /player-linux    │   │  /player-windows   │
+        │                    └───────────────────┘   └────────────────────┘
 ```
 
 ## Repository layout
 
 ```
 /digital-signage-project
-├── server/           FastAPI backend (REST + WebSocket + uploads)
-├── cms-frontend/     Vue 3 + Vite single-page admin UI
-└── player-linux/     PyQt6 kiosk player (mpv video, web widgets)
+├── server/            FastAPI backend (REST + WebSocket + uploads)
+├── cms-frontend/      Vue 3 + Vite single-page admin UI
+├── player-linux/      PyQt6 kiosk player for Linux (systemd watchdog)
+└── player-windows/    PyQt6 kiosk player for Windows (Task Scheduler)
 ```
 
 ## Quick start
@@ -92,6 +96,45 @@ sudo cp player-linux/screenview-player.service /etc/systemd/system/
 sudo systemctl enable --now screenview-player.service
 ```
 
+### 4. Player (Windows)
+
+```powershell
+cd player-windows
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+
+# Edit config.json: set "server_url" to the CMS host, then:
+python main.py
+```
+
+The Windows player has identical behaviour to the Linux one, plus
+Windows-specific integration:
+
+- Stable machine identifier via the Windows registry (`MachineGuid`)
+  with `wmic csproduct` and MAC fallbacks.
+- Persistent state under `%LOCALAPPDATA%\ScreenView\` (config, cache,
+  rotating logs).
+- Per-monitor v2 DPI awareness so fullscreen matches the physical screen.
+- `SetThreadExecutionState` keeps the display and system awake.
+- Named-mutex single-instance guard, hidden subprocess windows.
+- Disabled `Alt+F4` / `Ctrl+W` kiosk escape shortcuts.
+
+To build a standalone `.exe` and register the auto-restart Task Scheduler
+entry (Windows equivalent of `Restart=always`):
+
+```powershell
+# Build ScreenViewPlayer.exe (drop libmpv-2.dll next to the .spec first).
+.\player-windows\scripts\build.ps1
+
+# Then on each kiosk, from an elevated PowerShell:
+.\player-windows\scripts\install.ps1 `
+    -InstallDir "C:\Program Files\ScreenView" `
+    -ServerUrl  "https://signage.example.com"
+```
+
+See `player-windows/README.md` for the full kiosk lockdown checklist.
+
 ## Architectural principles
 
 1. **Store & Forward.** The player never renders a file streamed from the
@@ -103,7 +146,8 @@ sudo systemctl enable --now screenview-player.service
    last cached playlist forever; reconnection is fully idempotent.
 4. **Strict thread separation on the player.** The `QThread` worker owns
    all I/O; the UI thread only renders. They communicate through PyQt
-   signals — see `player-linux/worker_network.py`.
+   signals — see `player-linux/worker_network.py` and
+   `player-windows/worker_network.py`.
 5. **Atomic playlist swaps.** A newly downloaded playlist only takes
    effect at the end of the currently playing media, so the viewer never
    sees partial or broken content.
@@ -136,8 +180,9 @@ Defined in `server/models.py` (SQLModel):
 pip install pytest httpx
 python -m pytest server/tests
 
-# Player (pure helpers; PyQt tests auto-skip without a display)
+# Players (pure helpers; PyQt tests auto-skip without a display)
 python -m pytest player-linux/tests
+python -m pytest player-windows/tests
 ```
 
 ## Roadmap
